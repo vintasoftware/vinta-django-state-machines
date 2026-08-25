@@ -1,0 +1,40 @@
+.dsm-editor {
+  margin: 0 0 1rem;
+}
+
+.dsm-editor__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.dsm-editor__status {
+  font-size: 0.8125rem;
+  color: var(--body-quiet-color, #666);
+}
+
+.dsm-editor__status--ok {
+  color: var(--object-tools-bg, #417690);
+}
+
+.dsm-editor__status--dirty {
+  color: var(--body-quiet-color, #666);
+}
+
+.dsm-editor__status--error {
+  color: var(--error-fg, #ba2121);
+}
+
+.dsm-editor state-machine-editor {
+  display: block;
+  height: 70vh;
+  min-height: 420px;
+  border: 1px solid var(--hairline-color, #e8e8e8);
+  border-radius: 4px;
+  /* The component themes itself from these; borrowing the admin's variables keeps
+     the canvas in step with light and dark mode without a second palette. */
+  --sme-accent: var(--primary, #417690);
+  --sme-surface: var(--body-bg, #fff);
+  --sme-canvas: var(--darkened-bg, #f8f8f8);
+}

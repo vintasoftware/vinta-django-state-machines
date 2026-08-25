@@ -1,0 +1,38 @@
+{% extends "admin/change_form.html" %}
+{% load i18n static %}
+
+{% block extrahead %}
+  {{ block.super }}
+  {% if dsm_editor %}
+    <link rel="stylesheet" href="{% static 'vinta_state_machines/admin-editor.css' %}">
+    <script type="module" src="{% static 'vinta_state_machines/admin-editor.js' %}"></script>
+  {% endif %}
+{% endblock %}
+
+{% block after_field_sets %}
+  {{ block.super }}
+  {% if dsm_editor %}
+    <fieldset class="module aligned">
+      <h2>{% translate "Graph" %}</h2>
+      <div class="dsm-editor"
+           id="dsm-editor"
+           data-machine-url="{{ dsm_editor.machine_url }}"
+           data-side-effects-url="{{ dsm_editor.side_effects_url }}"
+           data-actions-url="{{ dsm_editor.actions_url }}"
+           data-guard-url="{{ dsm_editor.guard_url }}"
+           data-readonly="{% if dsm_editor.read_only %}1{% else %}0{% endif %}">
+        <div class="dsm-editor__bar">
+          {% if not dsm_editor.read_only %}
+            <button type="button" class="default" data-dsm-save>{% translate "Save graph" %}</button>
+          {% endif %}
+          <span class="dsm-editor__status" data-dsm-status>
+            {% if dsm_editor.read_only %}
+              {% translate "This version is no longer a draft, so its graph is read only." %}
+            {% endif %}
+          </span>
+        </div>
+        <state-machine-editor></state-machine-editor>
+      </div>
+    </fieldset>
+  {% endif %}
+{% endblock %}

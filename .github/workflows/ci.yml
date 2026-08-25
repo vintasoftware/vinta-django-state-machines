@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"
+  UV_FROZEN: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install the project
+        run: uv sync --all-groups
+
+      - run: uv run ruff check --output-format=github .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+
+      - name: Check for missing migrations
+        run: uv run python -m tests.manage makemigrations --check --dry-run
+
+      - name: Check for missing migrations with the scope model swapped
+        env:
+          DJANGO_SETTINGS_MODULE: tests.settings_swapped
+        run: uv run python -m tests.manage makemigrations --check --dry-run
+
+  test:
+    name: Python ${{ matrix.python-version }} / Django ${{ matrix.django }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Django 5.2 supports 3.10 through 3.13; 6.0 and later require 3.12+.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        django: ["5.2", "6.0"]
+        exclude:
+          - python-version: "3.10"
+            django: "6.0"
+          - python-version: "3.11"
+            django: "6.0"
+        include:
+          - python-version: "3.13"
+            django: "main"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the project
+        run: uv sync --all-groups
+
+      - name: Pin Django ${{ matrix.django }}
+        run: |
+          if [ "${{ matrix.django }}" = "main" ]; then
+            uv pip install "https://github.com/django/django/archive/main.tar.gz"
+          else
+            uv pip install "django>=${{ matrix.django }},<$(echo ${{ matrix.django }} | awk -F. '{print $1"."$2+1}')"
+          fi
+
+      - name: Show the resolved versions
+        run: uv run python -c "import django, sys; print(sys.version); print(django.get_version())"
+
+      # Meta.swappable resolves once per process, so the swapped scope model gets its
+      # own settings module and its own run.  It goes first and reports nothing: it
+      # seeds the coverage data the main run then appends to, so the reports below
+      # cover both configurations.
+      - name: Run the swapped-scope suite
+        run: >-
+          uv run --no-sync pytest tests/swapped -q -p no:cacheprovider
+          --ds=tests.settings_swapped --cov --cov-report=
+
+      - name: Run the test suite
+        run: >-
+          uv run --no-sync pytest --cov --cov-append --cov-report=xml
+          --cov-report=term-missing
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.13' && matrix.django == '6.0'
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: error
+
+  # Django's main branch breaks for reasons that are not this project's fault, so it
+  # reports without gating the merge.
+  test-main-allowed-to-fail:
+    name: Django main (informational)
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Django main results are advisory."
+
+  build:
+    name: Build the distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - run: uv build
+
+      - name: Check the metadata renders on PyPI
+        run: uvx twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  pre-commit:
+    name: pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - run: uv sync --all-groups
+
+      - name: Run every hook
+        run: uv run pre-commit run --all-files --show-diff-on-failure
