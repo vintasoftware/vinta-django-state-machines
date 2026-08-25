@@ -1,6 +1,11 @@
 default_language_version:
   python: python3
 
+# The editor bundle and the licence notice extracted from it are vendored verbatim from
+# the vinta-state-machine-editor npm package.  Letting the whitespace hooks rewrite a
+# minified artifact only diverges it from upstream and comes back on the next re-vendor.
+exclude: ^vinta_state_machines/static/vinta_state_machines/state-machine-editor\.
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
