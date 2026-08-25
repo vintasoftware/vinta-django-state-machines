@@ -6,7 +6,40 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-25
+
+First release under the `vinta-django-state-machines` name, superseding the
+`django-state-machines` package. The **Changed** entries below are relative to that
+package; if this is your first install, only **Added** applies.
+
 ### Added
+
+- `StatusDefinition` and `ActionType`: the shared, unversioned status and action
+  vocabularies, referenced everywhere by stable key.
+- `StateMachine` → `StateMachineVersion` → `StateMachineState` / `StateMachineTransition`:
+  a versioned graph per `(entity_type, status_field)`, with named, guarded transitions
+  carrying an `action_key`, a `guard`, a `required_permission` and a `requires_approval`
+  flag.
+- States carry `x` and `y` positions, so a version is also the layout of its own diagram.
+- Self transitions, and any number of parallel edges between one pair of states. When
+  several edges share an action, the engine takes the first, by `order`, whose permission
+  and guard both hold; `transition_name=` picks one explicitly.
+- `StatusKeyField` and `StateMachineVersionField`, so a record stores its status as a soft
+  reference and pins the version it was created under. Publishing never migrates data.
+- A transition engine: `available_transitions`, `can_transition` and `transition`, plus the
+  same methods as sugar on `StateMachineMixin`.
+- `StatusTransition`: an append-only, polymorphic history of every status change, recording
+  the exact edge that ran and the version that authorized it.
+- `StateMachineHook` and the `register_side_effect` registry: functions registered under a
+  unique key, wired from the catalog to run before or after a specific transition, any
+  transition, entering a state or leaving a state. Each binding stores a JSON `params`
+  parameter, so one handler wired to several transitions behaves differently on each.
+- Authoring services: `validate_version`, `publish_version`, `clone_version`,
+  `archive_version`, `rebase_record` and `define_machine`.
+- Management commands `import_state_machine`, `export_state_machine` and
+  `validate_state_machines`.
+- Admin for the whole catalog, with publish and validate actions.
+- System checks for mis-declared status fields.
 
 - A canvas editor on the `StateMachineVersion` change form, backed by the
   `vinta-state-machine-editor` web component, which ships pre-bundled in this package's
@@ -57,38 +90,5 @@ All notable changes to this project are documented here. The format follows
   leaving the same state, so the two sort identically; `define_machine` still numbers
   across the version.
 
-## [0.1.0] - 2026-08-23
-
-Initial release.
-
-### Added
-
-- `StatusDefinition` and `ActionType`: the shared, unversioned status and action
-  vocabularies, referenced everywhere by stable key.
-- `StateMachine` → `StateMachineVersion` → `StateMachineState` / `StateMachineTransition`:
-  a versioned graph per `(entity_type, status_field)`, with named, guarded transitions
-  carrying an `action_key`, a `guard`, a `required_permission` and a `requires_approval`
-  flag.
-- States carry `x` and `y` positions, so a version is also the layout of its own diagram.
-- Self transitions, and any number of parallel edges between one pair of states. When
-  several edges share an action, the engine takes the first, by `order`, whose permission
-  and guard both hold; `transition_name=` picks one explicitly.
-- `StatusKeyField` and `StateMachineVersionField`, so a record stores its status as a soft
-  reference and pins the version it was created under. Publishing never migrates data.
-- A transition engine: `available_transitions`, `can_transition` and `transition`, plus the
-  same methods as sugar on `StateMachineMixin`.
-- `StatusTransition`: an append-only, polymorphic history of every status change, recording
-  the exact edge that ran and the version that authorized it.
-- `StateMachineHook` and the `register_side_effect` registry: functions registered under a
-  unique key, wired from the catalog to run before or after a specific transition, any
-  transition, entering a state or leaving a state. Each binding stores a JSON `params`
-  parameter, so one handler wired to several transitions behaves differently on each.
-- Authoring services: `validate_version`, `publish_version`, `clone_version`,
-  `archive_version`, `rebase_record` and `define_machine`.
-- Management commands `import_state_machine`, `export_state_machine` and
-  `validate_state_machines`.
-- Admin for the whole catalog, with publish and validate actions.
-- System checks for mis-declared status fields.
-
-[Unreleased]: https://github.com/vintasoftware/django-state-machines/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/vintasoftware/django-state-machines/releases/tag/v0.1.0
+[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/vintasoftware/vinta-django-state-machines/releases/tag/v0.1.0
