@@ -307,7 +307,7 @@ def test_a_scope_model_that_never_implemented_the_hook_is_reported(monkeypatch):
     from vinta_state_machines.checks import check_scope_model
     from vinta_state_machines.models import AbstractStateMachineScope
 
-    class Unfinished(AbstractStateMachineScope[str]):
+    class Unfinished(AbstractStateMachineScope):
         class Meta:
             app_label = "tests"
 

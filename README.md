@@ -573,7 +573,7 @@ from vinta_state_machines.enums import ScopeType
 from vinta_state_machines.models import AbstractStateMachineScope
 
 
-class OrganizationScope(AbstractStateMachineScope[Organization]):
+class OrganizationScope(AbstractStateMachineScope):
     """The adapter between the library and your own tenant table."""
 
     organization = models.ForeignKey(Organization, null=True, blank=True, on_delete=models.PROTECT)

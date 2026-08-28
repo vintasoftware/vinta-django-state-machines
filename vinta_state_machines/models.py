@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey
@@ -47,16 +47,17 @@ class TimeStampedModel(models.Model):
 
 # ----------------------------------------------------------------------- tenancy
 
-ScopeValue = TypeVar("ScopeValue")
 
-
-class AbstractStateMachineScope(TimeStampedModel, Generic[ScopeValue]):
+class AbstractStateMachineScope(TimeStampedModel):
     """A tenancy bucket: the slice of the world one machine governs.
 
     Subclasses decide what a scope *is* by implementing the :attr:`scope` property over
     whatever columns suit them -- a foreign key to an organization, a workspace slug, a
     composite -- while this class owns the one rule that holds whatever they choose:
-    :attr:`scope_type` and :attr:`scope` agree, always.
+    :attr:`scope_type` and :attr:`scope` agree, always.  Each subclass annotates its own
+    :attr:`scope` with the type it actually returns; the base cannot be generic in it,
+    because Django serialises a model's bases into every migration that creates it and
+    a ``typing.Generic`` recorded there cannot be rebuilt on Python before 3.12.
 
     :attr:`scope_key` is the portable spelling of that value, and the reason it is a
     *column* rather than a property: primary keys do not cross databases, so an exported
@@ -118,11 +119,11 @@ class AbstractStateMachineScope(TimeStampedModel, Generic[ScopeValue]):
         return self.scope_type == ScopeType.GLOBAL
 
     @property
-    def scope(self) -> ScopeValue | None:
+    def scope(self) -> Any:
         raise NotImplementedError("Needs to be implemented on subclass")
 
     @scope.setter
-    def scope(self, value: ScopeValue | None) -> None:
+    def scope(self, value: Any) -> None:
         raise NotImplementedError("Needs to be implemented on subclass")
 
     @scope.deleter
@@ -155,7 +156,7 @@ class AbstractStateMachineScope(TimeStampedModel, Generic[ScopeValue]):
             raise ValueError("The scope value and scope type fields do not match")
 
 
-class StateMachineScope(AbstractStateMachineScope[str]):
+class StateMachineScope(AbstractStateMachineScope):
     """The scope model this app ships: an opaque string.
 
     Enough for a project with no tenant concept -- it holds the single global row and

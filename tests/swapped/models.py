@@ -39,7 +39,7 @@ class Organization(models.Model):
         return self.slug
 
 
-class OrganizationScope(AbstractStateMachineScope[Organization]):
+class OrganizationScope(AbstractStateMachineScope):
     """A scope that is one organization, or the whole installation.
 
     ``PROTECT``, not ``CASCADE``: deleting an organization must not delete the record of
