@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vinta-django-state-machines"
-version = "0.1.0"
+version = "0.2.0"
 description = "Data-driven, versioned state machines for Django: a status catalog, published state-machine versions pinned per record, guarded transitions and an append-only status history."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -112,6 +112,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["DJ008", "PT018", "RUF043"]
 "vinta_state_machines/migrations/*" = ["E501"]
+# Shadows the stdlib ``types`` only as a submodule, which Python 3 cannot confuse with
+# it. Named to match ``vinta_audit_logs.types``, whose DTOs these mirror.
+"vinta_state_machines/types.py" = ["A005"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["vinta_state_machines"]

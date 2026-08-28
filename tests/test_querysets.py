@@ -39,8 +39,18 @@ def test_without_the_prefetch_the_graph_still_avoids_n_plus_one(
     risk_version, django_assert_num_queries
 ):
     version = StateMachineVersion.objects.select_related("state_machine").get(pk=risk_version.pk)
+    with django_assert_num_queries(4):
+        # One query each for the states, the transitions and the hooks, plus one for the
+        # machine's scope -- whose key is denormalised onto every history row, so the
+        # graph has to carry it. A constant, not an N+1: the graph is cached per version.
+        version.graph()
+
+
+def test_selecting_the_scope_too_removes_the_extra_query(risk_version, django_assert_num_queries):
+    version = StateMachineVersion.objects.select_related("state_machine__scope").get(
+        pk=risk_version.pk
+    )
     with django_assert_num_queries(3):
-        # One query each for the states, the transitions and the hooks.
         version.graph()
 
 

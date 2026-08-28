@@ -168,7 +168,14 @@ class SideEffectContext:
     """The hook row that wired this handler in."""
 
     actor: Any = None
-    """The acting principal, usually a user. ``None`` means the system."""
+    """The *live* principal that triggered the move, exactly as the caller passed it.
+
+    A user, an identity row, an ``IdentitySnapshot``, or ``None`` for the system. This
+    is deliberately not the identity row the history was written against: ``before``
+    handlers run before that row exists, and a handler that wants to check a permission
+    needs something it can ask. ``after`` handlers that want the recorded snapshot read
+    it from ``context.record.actor``.
+    """
 
     params: dict[str, Any] = field(default_factory=dict)
     """The JSON parameter stored on this handler's binding, verbatim.

@@ -136,7 +136,7 @@ def test_targeting_an_edge_with_the_wrong_action_is_refused(risk):
 
 
 def test_available_transitions_expose_their_names(risk, user):
-    assert [option.name for option in available_transitions(risk, user=user)] == ["assess"]
+    assert [option.name for option in available_transitions(risk, actor=user)] == ["assess"]
 
 
 # ------------------------------------------------------------ self transitions
@@ -165,7 +165,7 @@ def test_a_self_transition_is_reported_as_one(with_self_edge):
 
 def test_a_self_transition_is_offered_like_any_other(with_self_edge, risk, user):
     transition(risk, "risk.assess")
-    assert "risk.reassess" in [option.action for option in available_transitions(risk, user=user)]
+    assert "risk.reassess" in [option.action for option in available_transitions(risk, actor=user)]
 
 
 def test_a_self_transition_is_no_longer_a_validation_warning(with_self_edge):
@@ -223,7 +223,7 @@ def test_two_states_may_be_joined_by_several_edges(parallel):
 def test_the_first_candidate_whose_guard_holds_wins(parallel, privileged_user):
     big = Risk.objects.create(title="Big", amount=5000)
     transition(big, "risk.assess")
-    record = transition(big, "risk.mitigate", user=privileged_user)
+    record = transition(big, "risk.mitigate", actor=privileged_user)
     assert big.status_key == "mitigated"
     assert record.transition.name == "mitigate_large"
 
@@ -231,7 +231,7 @@ def test_the_first_candidate_whose_guard_holds_wins(parallel, privileged_user):
 def test_a_candidate_whose_guard_fails_is_skipped_for_the_next(parallel, user):
     small = Risk.objects.create(title="Small", amount=10)
     transition(small, "risk.assess")
-    record = transition(small, "risk.mitigate", user=user)
+    record = transition(small, "risk.mitigate", actor=user)
     assert record.transition.name == "mitigate"  # the guarded edge does not apply
 
 
@@ -239,7 +239,7 @@ def test_a_candidate_the_caller_may_not_take_is_skipped(parallel, user):
     """The permissioned edge is ordered first, but this user falls through to the other."""
     big = Risk.objects.create(title="Big", amount=5000)
     transition(big, "risk.assess")
-    record = transition(big, "risk.mitigate", user=user)
+    record = transition(big, "risk.mitigate", actor=user)
     assert record.transition.name == "mitigate"
 
 
@@ -249,7 +249,7 @@ def test_when_no_candidate_is_viable_the_first_one_explains_why(parallel, user):
     big = Risk.objects.create(title="Big", amount=5000)
     transition(big, "risk.assess")
     with pytest.raises(PermissionDenied, match="testapp.change_risk"):
-        transition(big, "risk.mitigate", user=user)
+        transition(big, "risk.mitigate", actor=user)
 
 
 def test_a_single_candidate_still_raises_its_own_specific_error(risk_version):
@@ -262,15 +262,15 @@ def test_a_single_candidate_still_raises_its_own_specific_error(risk_version):
 def test_can_transition_is_true_when_any_candidate_is_viable(parallel, user):
     small = Risk.objects.create(title="Small", amount=10)
     transition(small, "risk.assess")
-    assert can_transition(small, "risk.mitigate", user=user) is True
+    assert can_transition(small, "risk.mitigate", actor=user) is True
 
 
 def test_can_transition_narrowed_to_one_edge_answers_for_that_edge(parallel, user):
     small = Risk.objects.create(title="Small", amount=10)
     transition(small, "risk.assess")
-    assert can_transition(small, "risk.mitigate", user=user, transition_name="mitigate") is True
+    assert can_transition(small, "risk.mitigate", actor=user, transition_name="mitigate") is True
     assert (
-        can_transition(small, "risk.mitigate", user=user, transition_name="mitigate_large")
+        can_transition(small, "risk.mitigate", actor=user, transition_name="mitigate_large")
         is False
     )
 
@@ -278,14 +278,14 @@ def test_can_transition_narrowed_to_one_edge_answers_for_that_edge(parallel, use
 def test_naming_an_edge_overrides_the_resolution_order(parallel, privileged_user):
     big = Risk.objects.create(title="Big", amount=5000)
     transition(big, "risk.assess")
-    record = transition(big, "risk.mitigate", user=privileged_user, transition_name="mitigate")
+    record = transition(big, "risk.mitigate", actor=privileged_user, transition_name="mitigate")
     assert record.transition.name == "mitigate"
 
 
 def test_both_edges_are_listed_as_available(parallel, privileged_user):
     big = Risk.objects.create(title="Big", amount=5000)
     transition(big, "risk.assess")
-    options = available_transitions(big, user=privileged_user, include_blocked=True)
+    options = available_transitions(big, actor=privileged_user, include_blocked=True)
     assert {option.name for option in options} == {"mitigate", "mitigate_large", "reject"}
 
 

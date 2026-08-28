@@ -26,6 +26,7 @@ from vinta_state_machines.models import (
     ActionType,
     StateMachine,
     StateMachineHook,
+    StateMachineIdentity,
     StateMachineScope,
     StateMachineState,
     StateMachineTransition,
@@ -297,8 +298,9 @@ if StateMachineScope._meta.swapped is None:
 
     @admin.register(StateMachineScope)
     class StateMachineScopeAdmin(admin.ModelAdmin):
-        list_display = ("key", "name", "machine_count")
-        search_fields = ("key", "name")
+        list_display = ("scope_key", "scope_type", "label", "machine_count")
+        list_filter = ("scope_type",)
+        search_fields = ("scope_key", "label")
 
         def get_queryset(self, request: Any) -> QuerySet[StateMachineScope]:
             queryset: QuerySet[StateMachineScope] = super().get_queryset(request)
@@ -307,6 +309,25 @@ if StateMachineScope._meta.swapped is None:
         @admin.display(description=_("machines"), ordering="_machines")
         def machine_count(self, obj: StateMachineScope) -> int:
             return int(obj._machines)  # type: ignore[attr-defined]
+
+
+if StateMachineIdentity._meta.swapped is None:
+
+    @admin.register(StateMachineIdentity)
+    class StateMachineIdentityAdmin(admin.ModelAdmin):
+        list_display = ("identity_label", "identity_type", "identity_key", "created_at")
+        list_filter = ("identity_type", "is_staff", "is_superuser")
+        search_fields = ("identity_key", "identity_label")
+        date_hierarchy = "created_at"
+        list_select_related = ("user",)
+
+        # Snapshots, not records of a principal: editing one would rewrite what somebody
+        # was allowed to do at a moment that has already passed.
+        def has_add_permission(self, request: HttpRequest) -> bool:
+            return False
+
+        def has_change_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+            return False
 
 
 @admin.register(StateMachine)
@@ -331,8 +352,8 @@ class StatusTransitionAdmin(admin.ModelAdmin):
         "transition",
         "actor",
     )
-    list_filter = ("target_type", "status_field", "state_machine_version")
-    search_fields = ("target_id", "comment")
+    list_filter = ("target_type", "status_field", "state_machine_version", "actor_type")
+    search_fields = ("target_id", "comment", "actor_key", "scope_key")
     date_hierarchy = "created_at"
     list_select_related = (
         "from_status",

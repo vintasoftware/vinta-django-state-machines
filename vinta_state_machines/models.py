@@ -2,22 +2,29 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
-from django.core.validators import RegexValidator
 from django.db import models
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
-from vinta_state_machines.conf import scope_model_path
-from vinta_state_machines.enums import HookEvent, HookTiming, Lifecycle, StateColor
+from vinta_state_machines.conf import identity_model_path, scope_model_path
+from vinta_state_machines.enums import (
+    HookEvent,
+    HookTiming,
+    IdentityType,
+    Lifecycle,
+    ScopeType,
+    StateColor,
+)
 from vinta_state_machines.querysets import (
     StateMachineVersionQuerySet,
     StatusTransitionQuerySet,
 )
+from vinta_state_machines.types import IdentitySnapshot
 
 if TYPE_CHECKING:
     from vinta_state_machines.graph import VersionGraph
@@ -40,49 +47,299 @@ class TimeStampedModel(models.Model):
 
 # ----------------------------------------------------------------------- tenancy
 
+ScopeValue = TypeVar("ScopeValue")
 
-class StateMachineScope(TimeStampedModel):
+
+class AbstractStateMachineScope(TimeStampedModel, Generic[ScopeValue]):
     """A tenancy bucket: the slice of the world one machine governs.
 
-    Swappable through ``STATE_MACHINES_SCOPE_MODEL``, so a project can point it at its
-    own tenant model — an organization, a workspace — and get a real foreign key with
-    real cascade instead of a loose string.  The default model below is enough on its
-    own: a stable key and a name.
+    Subclasses decide what a scope *is* by implementing the :attr:`scope` property over
+    whatever columns suit them -- a foreign key to an organization, a workspace slug, a
+    composite -- while this class owns the one rule that holds whatever they choose:
+    :attr:`scope_type` and :attr:`scope` agree, always.
 
-    A machine with no scope is *global*: it governs every tenant that has not been given
-    one of its own.  Single tenant installs never populate this table.
+    :attr:`scope_key` is the portable spelling of that value, and the reason it is a
+    *column* rather than a property: primary keys do not cross databases, so an exported
+    machine carries the key and an import resolves it back with an indexed lookup on the
+    pair below.
 
-    A swapped in model must supply the two members below, which is what keeps an
-    exported machine portable across databases: primary keys do not travel, keys do.
+    A scope whose ``scope_type`` is ``GLOBAL`` is the fallback every tenant resolves to
+    when it has not been given a machine of its own, which is why a single tenant
+    project never has to think about this table beyond the one row in it.
+
+    Field for field this is ``vinta_audit_logs.models.AbstractAuditScope``, so a project
+    running both libraries can point ``STATE_MACHINES_SCOPE_MODEL`` and
+    ``AUDIT_SCOPE_MODEL`` at one model of its own.  Changing the shape here wants the
+    same change there.
     """
 
-    key = models.CharField(
-        _("key"),
-        max_length=150,
-        unique=True,
-        validators=[RegexValidator(KEY_REGEX, KEY_VALIDATOR_MESSAGE)],
-        help_text=_("Stable key, e.g. 'org.acme'. Travels with an exported machine."),
+    scope_type = models.CharField(
+        _("scope type"),
+        max_length=20,
+        choices=ScopeType.choices,
+        default=ScopeType.GLOBAL,
     )
-    name = models.CharField(_("name"), max_length=200, blank=True)
+
+    # The scope as a string, maintained by ``save``.  Machines are exported and imported
+    # by this value, so it has to be stable for the life of the scope: definitions
+    # written under an old key do not follow a new one.
+    scope_key = models.CharField(_("scope key"), max_length=255, blank=True, db_index=True)
+
+    # Human-readable name, for the admin and for exports.  A live value, not a snapshot:
+    # a scope is a thing that still exists.
+    label = models.CharField(_("label"), max_length=255, blank=True)
 
     class Meta:
-        verbose_name = _("state machine scope")
-        verbose_name_plural = _("state machine scopes")
-        ordering = ("key",)
-        swappable = "STATE_MACHINES_SCOPE_MODEL"
+        abstract = True
+        ordering = ("scope_type", "scope_key")
 
     def __str__(self) -> str:
-        return self.key
+        return self.label or self.scope_key or str(ScopeType(self.scope_type).label)
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        self.validate_scope()
+        self.scope_key = self.build_scope_key()
+        if (
+            update_fields := kwargs.get("update_fields")
+        ) is not None and "scope_key" not in update_fields:
+            # A partial update that moves the scope but leaves ``scope_key`` behind
+            # would silently detach the scope from the machines exported under it, so
+            # add the column rather than let the write proceed.
+            kwargs["update_fields"] = [*update_fields, "scope_key"]
+        super().save(*args, **kwargs)
+
+    def clean(self) -> None:
+        super().clean()
+        self.validate_scope()
 
     @property
-    def scope_key(self) -> str:
-        """The portable identifier for this scope."""
-        return self.key
+    def is_global(self) -> bool:
+        """Whether this is the fallback scope rather than one tenant's."""
+        return self.scope_type == ScopeType.GLOBAL
+
+    @property
+    def scope(self) -> ScopeValue | None:
+        raise NotImplementedError("Needs to be implemented on subclass")
+
+    @scope.setter
+    def scope(self, value: ScopeValue | None) -> None:
+        raise NotImplementedError("Needs to be implemented on subclass")
+
+    @scope.deleter
+    def scope(self) -> None:
+        raise NotImplementedError("Needs to be implemented on subclass")
+
+    def build_scope_key(self) -> str:
+        """Return the portable string form of this scope.
+
+        Must be stable for the life of the scope and unique among scopes of the same
+        :attr:`scope_type`.
+
+        Returns:
+            The key, or ``""`` for the global scope.
+        """
+        raise NotImplementedError("Needs to be implemented on subclass")
+
+    def validate_scope(self) -> None:
+        """Reject a row whose scope value and scope type disagree.
+
+        Checked against the *final* state rather than against what changed, so insert
+        and update run the identical rule and a partial update cannot slip a mismatch
+        through by touching only one of the two fields.
+
+        This is a convenience, not the guarantee: ``save`` is bypassed by
+        ``bulk_create`` and ``QuerySet.update``, so concrete subclasses are expected to
+        carry a ``CheckConstraint`` saying the same thing.
+        """
+        if self.is_global is not (self.scope is None):
+            raise ValueError("The scope value and scope type fields do not match")
+
+
+class StateMachineScope(AbstractStateMachineScope[str]):
+    """The scope model this app ships: an opaque string.
+
+    Enough for a project with no tenant concept -- it holds the single global row and
+    nothing else -- and the default ``STATE_MACHINES_SCOPE_MODEL`` points at.  A project
+    with a real boundary points the setting at its own subclass instead and gets a
+    foreign key, a label, and whatever else belongs on a tenant.
+    """
+
+    # Underscore-prefixed because ``scope`` itself is the property above; this is the
+    # column behind it.  Non-nullable with ``""`` as the absent value, because an empty
+    # string participates in constraints and indexes where NULL would not.
+    _scope = models.CharField(_("scope"), max_length=255, blank=True)
+
+    class Meta(AbstractStateMachineScope.Meta):
+        abstract = False
+        verbose_name = _("state machine scope")
+        verbose_name_plural = _("state machine scopes")
+        swappable = "STATE_MACHINES_SCOPE_MODEL"
+        constraints: ClassVar = [
+            # The invariant ``validate_scope`` checks, held where ``save`` cannot reach.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(scope_type=ScopeType.GLOBAL, _scope="")
+                    | ~models.Q(scope_type=ScopeType.GLOBAL) & ~models.Q(_scope="")
+                ),
+                name="statemachinescope_type_and_value_agree",
+            ),
+            models.UniqueConstraint(
+                fields=("scope_type", "scope_key"),
+                name="statemachinescope_unique_key_per_type",
+            ),
+        ]
+
+    @property
+    def scope(self) -> str | None:
+        return self._scope if self._scope != "" else None
+
+    @scope.setter
+    def scope(self, value: str | None) -> None:
+        self._scope = value if value is not None else ""
+        self.scope_type = ScopeType.GLOBAL if value is None else ScopeType.SCOPED
+
+    @scope.deleter
+    def scope(self) -> None:
+        self._scope = ""
+        self.scope_type = ScopeType.GLOBAL
+
+    def build_scope_key(self) -> str:
+        return self._scope
+
+
+# ---------------------------------------------------------------------- identities
+
+
+class AbstractStateMachineIdentity(TimeStampedModel):
+    """Who acted, captured as they were at the moment they acted.
+
+    **One row per reference, not one per principal.**  The columns below are a snapshot:
+    the groups, permissions and display name the actor carried when they moved a record
+    or published a version, which is the question a history is asked -- not what they
+    carry now.  Deduplicating rows per user would answer the wrong one.
+
+    Not every actor is a person.  A scheduled job, an API token and an internal service
+    all move records, so :attr:`user` is optional and the columns that identify the
+    actor -- :attr:`identity_type`, :attr:`identity_key`, :attr:`identity_label` -- are
+    always populated whether or not a row in the user table backs them.
+
+    Those columns are also what lets a history outlive its actors.  :attr:`user` is
+    ``SET_NULL`` rather than ``PROTECT``, so deleting a user (an erasure request, an
+    offboarding) neither fails nor takes the history with it; what the user *was* stays
+    legible afterwards.
+
+    Field for field this is ``vinta_audit_logs.models.AbstractAuditIdentity``; see
+    :class:`AbstractStateMachineScope` for why that matters.
+    """
+
+    # One of :class:`~vinta_state_machines.enums.IdentityType`, or a value the installing
+    # project defines.  No ``choices``: see that enum's docstring.
+    identity_type = models.CharField(_("identity type"), max_length=32, default=IdentityType.USER)
+
+    # Stable identifier for the principal, as a string so it holds a user pk, a token id
+    # or a job name equally well.  For a user this is the pk at capture time, which is
+    # what keeps the row identifiable once ``user`` has been nulled out.  ``""`` for a
+    # principal with no id at all -- the system acting on its own behalf.
+    identity_key = models.CharField(_("identity key"), max_length=255, blank=True)
+
+    # Human-readable name at capture time.  A snapshot, not a live lookup.
+    identity_label = models.CharField(_("identity label"), max_length=255, blank=True)
+
+    # Live link to the principal when it is a user and still exists.  Nulled on
+    # deletion; the snapshot columns above carry on without it.
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        verbose_name=_("user"),
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+
+    # --- authorization snapshot ---
+    # What the actor could do at the time.  Groups and permissions are stored by name
+    # rather than by relation on purpose: an M2M would describe the actor's groups
+    # *now*, would break when a Group or Permission row is deleted, and would cost extra
+    # writes on a path that runs on every transition.  JSON lists of strings answer
+    # "what were they allowed to do when they did this".
+    is_staff = models.BooleanField(_("is staff"), default=False)
+    is_superuser = models.BooleanField(_("is superuser"), default=False)
+    group_names = models.JSONField(_("group names"), default=list, blank=True)
+    permission_keys = models.JSONField(_("permission keys"), default=list, blank=True)
+
+    # Whatever else the project captured about this principal -- a membership role, a
+    # token's scopes, the tenant it was restricted to.  Here rather than in project
+    # columns so a project can extend the snapshot without swapping the model out; a
+    # project that wants real columns swaps it out and gets both.
+    metadata = models.JSONField(_("metadata"), default=dict, blank=True)
+
+    class Meta:
+        abstract = True
+        ordering = ("-created_at", "-pk")
+        indexes: ClassVar = [
+            models.Index(fields=("identity_type", "identity_key")),
+        ]
+
+    def __str__(self) -> str:
+        return self.identity_label or f"{self.identity_type}:{self.identity_key}"
+
+    @property
+    def is_system(self) -> bool:
+        """Whether this records the system acting on its own behalf."""
+        return self.identity_type == IdentityType.SYSTEM
 
     @classmethod
-    def from_scope_key(cls, key: str) -> StateMachineScope | None:
-        """Resolve a :attr:`scope_key` back to a row, or ``None`` when it is unknown."""
-        return cls.objects.filter(key=key).first()
+    def from_snapshot(cls, snapshot: IdentitySnapshot) -> AbstractStateMachineIdentity:
+        """Build an *unsaved* row from a portable snapshot.
+
+        The counterpart of :meth:`AbstractStateMachineScope.build_scope_key`: the model
+        owns its own construction, so a project that swaps in extra columns fills them
+        by overriding this rather than by configuring a builder somewhere else::
+
+            @classmethod
+            def from_snapshot(cls, snapshot):
+                row = super().from_snapshot(snapshot)
+                row.department = snapshot.metadata.get("department", "")
+                return row
+
+        ``metadata`` is passed through verbatim, so a subclass is free to promote keys
+        out of it into real columns and leave the rest where it is.
+        """
+        return cls(
+            identity_type=snapshot.identity_type,
+            identity_key=snapshot.identity_key,
+            identity_label=snapshot.identity_label,
+            user_id=snapshot.user_id,
+            is_staff=snapshot.is_staff,
+            is_superuser=snapshot.is_superuser,
+            group_names=list(snapshot.group_names),
+            permission_keys=list(snapshot.permission_keys),
+            metadata=dict(snapshot.metadata),
+        )
+
+    def to_snapshot(self) -> IdentitySnapshot:
+        """The portable form of this row, for re-recording the same actor elsewhere."""
+        return IdentitySnapshot(
+            identity_type=self.identity_type,
+            identity_key=self.identity_key,
+            identity_label=self.identity_label,
+            user_id=self.user_id,
+            is_staff=self.is_staff,
+            is_superuser=self.is_superuser,
+            group_names=list(self.group_names or []),
+            permission_keys=list(self.permission_keys or []),
+            metadata=dict(self.metadata or {}),
+        )
+
+
+class StateMachineIdentity(AbstractStateMachineIdentity):
+    """The identity model this app ships.  See :class:`AbstractStateMachineIdentity`."""
+
+    class Meta(AbstractStateMachineIdentity.Meta):
+        abstract = False
+        verbose_name = _("state machine identity")
+        verbose_name_plural = _("state machine identities")
+        swappable = "STATE_MACHINES_IDENTITY_MODEL"
 
 
 # --------------------------------------------------------------------------- catalog
@@ -185,24 +442,23 @@ class StateMachine(TimeStampedModel):
     scope = models.ForeignKey(
         scope_model_path(),
         verbose_name=_("scope"),
-        null=True,
-        blank=True,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         related_name="state_machines",
         help_text=_(
-            "The tenant this machine is specific to. Null means it is the global "
-            "machine, used by every tenant that has not been given its own."
+            "The tenant this machine is specific to. The global scope means it is the "
+            "fallback machine, used by every tenant not given one of its own."
         ),
     )
     name = models.CharField(_("name"), max_length=200)
     description = models.TextField(_("description"), blank=True)
     author = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
+        identity_model_path(),
         verbose_name=_("author"),
         null=True,
         blank=True,
-        on_delete=models.SET_NULL,
+        on_delete=models.PROTECT,
         related_name="authored_state_machines",
+        help_text=_("Who created this machine, as they were at the time."),
     )
     default_version = models.ForeignKey(
         "state_machines.StateMachineVersion",
@@ -219,28 +475,16 @@ class StateMachine(TimeStampedModel):
         verbose_name_plural = _("state machines")
         ordering = ("key",)
         constraints = [
-            # Two constraints per rule, because a NULL scope (the global machine) does
-            # not compare equal to itself and would slip past a single one -- the same
-            # shape StateMachineTransition uses for its nullable source.
+            # One constraint per rule.  The global machine is a scope *row* rather than
+            # a NULL, so there is no second, partial constraint here to cover the NULL
+            # that would not compare equal to itself.
             models.UniqueConstraint(
                 fields=("key", "scope"),
-                condition=models.Q(scope__isnull=False),
                 name="statemachine_unique_key_per_scope",
             ),
             models.UniqueConstraint(
-                fields=("key",),
-                condition=models.Q(scope__isnull=True),
-                name="statemachine_unique_global_key",
-            ),
-            models.UniqueConstraint(
                 fields=("entity_type", "status_field", "scope"),
-                condition=models.Q(scope__isnull=False),
                 name="statemachine_one_per_entity_field_per_scope",
-            ),
-            models.UniqueConstraint(
-                fields=("entity_type", "status_field"),
-                condition=models.Q(scope__isnull=True),
-                name="statemachine_one_global_per_entity_field",
             ),
         ]
 
@@ -281,12 +525,13 @@ class StateMachineVersion(TimeStampedModel):
     )
     published_at = models.DateTimeField(_("published at"), null=True, blank=True)
     author = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
+        identity_model_path(),
         verbose_name=_("author"),
         null=True,
         blank=True,
-        on_delete=models.SET_NULL,
+        on_delete=models.PROTECT,
         related_name="authored_state_machine_versions",
+        help_text=_("Who published this version, as they were at the time."),
     )
     notes = models.TextField(_("notes"), blank=True)
 
@@ -560,13 +805,20 @@ class StatusTransition(TimeStampedModel):
     scope = models.ForeignKey(
         scope_model_path(),
         verbose_name=_("scope"),
-        null=True,
-        blank=True,
         on_delete=models.PROTECT,
         related_name="+",
         help_text=_(
             "Denormalised from the machine that authorised the move, so a tenant's "
-            "history is one indexed filter away. Null for global machines."
+            "history is one indexed filter away."
+        ),
+    )
+    scope_key = models.CharField(
+        _("scope key"),
+        max_length=255,
+        blank=True,
+        help_text=_(
+            "The scope's portable key, copied onto the row so the browse index below "
+            "stands on its own and a history export needs no join."
         ),
     )
     action_type = models.ForeignKey(
@@ -590,14 +842,17 @@ class StatusTransition(TimeStampedModel):
         ),
     )
     actor = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
+        identity_model_path(),
         verbose_name=_("actor"),
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
+        on_delete=models.PROTECT,
         related_name="status_transitions",
-        help_text=_("Null means the change was made by the system."),
+        help_text=_(
+            "Who moved the record, as they were at the time. A move nobody was behind "
+            "carries a system identity rather than nothing."
+        ),
     )
+    actor_type = models.CharField(_("actor type"), max_length=32)
+    actor_key = models.CharField(_("actor key"), max_length=255, blank=True)
     comment = models.TextField(_("comment"), blank=True)
     metadata = models.JSONField(_("metadata"), default=dict, blank=True)
 
@@ -612,11 +867,17 @@ class StatusTransition(TimeStampedModel):
                 fields=("target_type", "target_id", "status_field", "-created_at"),
                 name="statustransition_target_idx",
             ),
-            # PROTECT above and this index are the pair that make the log usable per
-            # tenant: an audit trail outlives the tenant, and is queryable without a scan.
+            # PROTECT above and these indexes are what make the log usable per tenant:
+            # a history outlives the tenant, and is queryable without a scan.  They key
+            # on the denormalised copies rather than the foreign keys, so neither needs
+            # a join to be used.
             models.Index(
-                fields=("scope", "-created_at"),
+                fields=("scope_key", "-created_at"),
                 name="statustransition_scope_idx",
+            ),
+            models.Index(
+                fields=("scope_key", "actor_type", "actor_key", "-created_at"),
+                name="statustransition_actor_idx",
             ),
         ]
 

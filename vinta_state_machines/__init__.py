@@ -39,6 +39,6 @@ __all__ = [
     "default_app_config",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 default_app_config = "vinta_state_machines.apps.StateMachinesConfig"

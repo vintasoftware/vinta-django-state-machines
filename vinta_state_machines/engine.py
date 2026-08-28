@@ -3,12 +3,21 @@
 Every public function takes the record plus the *name of its status field*, because one
 model can carry several independently governed statuses (``status_key``,
 ``engagement_status_key``, ...), each pinned to its own machine and version.
+
+They also take an ``actor``: whoever is trying to move the record.  The engine keeps it
+*live* for as long as it is deciding -- permissions and guards need an object that can
+answer ``has_perm`` -- and only snapshots it into an identity row at the moment the move
+is written down.  See :mod:`vinta_state_machines.identities` for the two halves of that.
+Anything that module understands works here: a user, an identity row, an
+``IdentitySnapshot``, or ``None`` for the system.
 """
 
 from __future__ import annotations
 
+import functools
+import warnings
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from django.db import models, transaction
 
@@ -26,6 +35,7 @@ from vinta_state_machines.exceptions import (
 )
 from vinta_state_machines.fields import StatusFieldConfig, get_status_field_config
 from vinta_state_machines.guards import GuardSyntaxError, evaluate
+from vinta_state_machines.identities import resolve_identity
 from vinta_state_machines.models import (
     StateMachine,
     StateMachineVersion,
@@ -144,14 +154,46 @@ def _get_machine(config: StatusFieldConfig, instance: models.Model | None = None
     return machine
 
 
+_F = TypeVar("_F", bound="Callable[..., Any]")
+
+
+def _accepts_user_alias(func: _F) -> _F:
+    """Accept the pre-0.2 ``user=`` spelling of ``actor=`` for one release.
+
+    The rename is not cosmetic: the parameter now takes identities and snapshots as well
+    as users, so the old name had become a lie about what it accepts.  Callers that were
+    passing a user keep working unchanged and get told once, per call site.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if "user" in kwargs:
+            if "actor" in kwargs:
+                raise TypeError(
+                    f"{func.__name__}() got both 'actor' and the deprecated 'user'. "
+                    "Pass only 'actor'."
+                )
+            warnings.warn(
+                f"{func.__name__}(user=...) is deprecated; use actor=... instead. "
+                "It accepts a user, an identity row, an IdentitySnapshot, or None.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            kwargs["actor"] = kwargs.pop("user")
+        return func(*args, **kwargs)
+
+    return cast("_F", wrapper)
+
+
 # ------------------------------------------------------------------- inspection
 
 
+@_accepts_user_alias
 def available_transitions(
     instance: models.Model,
     field_name: str = "status_key",
     *,
-    user: Any = None,
+    actor: Any = None,
     metadata: Mapping[str, Any] | None = None,
     include_blocked: bool = False,
     enforce_permissions: bool = True,
@@ -176,7 +218,7 @@ def available_transitions(
             instance,
             spec,
             graph,
-            user=user,
+            actor=actor,
             metadata=metadata,
             enforce_permissions=enforce_permissions,
         )
@@ -186,19 +228,21 @@ def available_transitions(
     return results
 
 
+@_accepts_user_alias
 def available_actions(
-    instance: models.Model, field_name: str = "status_key", *, user: Any = None
+    instance: models.Model, field_name: str = "status_key", *, actor: Any = None
 ) -> list[str]:
     """Just the action keys the caller may fire right now."""
-    return [item.action for item in available_transitions(instance, field_name, user=user)]
+    return [item.action for item in available_transitions(instance, field_name, actor=actor)]
 
 
+@_accepts_user_alias
 def can_transition(
     instance: models.Model,
     action: str,
     field_name: str = "status_key",
     *,
-    user: Any = None,
+    actor: Any = None,
     metadata: Mapping[str, Any] | None = None,
     transition_name: str | None = None,
     enforce_permissions: bool = True,
@@ -218,7 +262,7 @@ def can_transition(
             instance,
             spec,
             graph,
-            user=user,
+            actor=actor,
             metadata=metadata,
             enforce_permissions=enforce_permissions,
         )
@@ -276,7 +320,7 @@ def _blocking_reason(
     spec: TransitionSpec,
     graph: VersionGraph,
     *,
-    user: Any,
+    actor: Any,
     metadata: Mapping[str, Any] | None,
     enforce_permissions: bool,
 ) -> str:
@@ -286,12 +330,12 @@ def _blocking_reason(
     if (
         enforce_permissions
         and spec.required_permission
-        and not _has_permission(user, spec.required_permission, instance)
+        and not _has_permission(actor, spec.required_permission, instance)
     ):
         return f"missing permission {spec.required_permission}"
     if spec.guard:
         try:
-            if not evaluate(spec.guard, _guard_context(instance, spec, user, metadata)):
+            if not evaluate(spec.guard, _guard_context(instance, spec, actor, metadata)):
                 return f"guard did not hold: {spec.guard}"
         except GuardSyntaxError as exc:
             return f"guard is invalid: {exc}"
@@ -303,12 +347,15 @@ def _blocking_reason(
 def _guard_context(
     instance: models.Model,
     spec: TransitionSpec,
-    user: Any,
+    actor: Any,
     metadata: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     return {
         "obj": instance,
-        "user": user,
+        "actor": actor,
+        # Kept alongside ``actor`` because guard expressions live in the database:
+        # renaming the key would silently change what every stored guard evaluates.
+        "user": actor,
         "action": spec.action,
         "from_status": spec.from_key,
         "to_status": spec.to_key,
@@ -316,29 +363,46 @@ def _guard_context(
     }
 
 
-def _has_permission(user: Any, permission: str, instance: models.Model) -> bool:
+def _has_permission(actor: Any, permission: str, instance: models.Model) -> bool:
     checker = get_setting("PERMISSION_CHECKER")
     if checker is not None:
-        return bool(checker(user, permission, instance))
-    if user is None:
+        return bool(checker(actor, permission, instance))
+    if actor is None:
         return False
-    has_perm = getattr(user, "has_perm", None)
-    if has_perm is None:
-        return False
-    # Object level backends answer the two-argument form; ModelBackend only the one
-    # argument form, and returns False whenever an object is supplied.
-    return bool(has_perm(permission, instance) or has_perm(permission))
+    has_perm = getattr(actor, "has_perm", None)
+    if has_perm is not None:
+        # Object level backends answer the two-argument form; ModelBackend only the one
+        # argument form, and returns False whenever an object is supplied.
+        return bool(has_perm(permission, instance) or has_perm(permission))
+    return _snapshot_grants(actor, permission)
+
+
+def _snapshot_grants(actor: Any, permission: str) -> bool:
+    """Answer from a recorded authorization snapshot, for an actor that is not live.
+
+    Reached when the caller passed an identity row or an ``IdentitySnapshot`` rather
+    than a user -- replaying a move, or acting as a principal this app cannot
+    introspect.  The answer is what the actor was allowed to do *when the snapshot was
+    taken*, which is the only honest answer available: there is no live object left to
+    ask, and inventing one by dereferencing ``identity.user`` would silently swap a
+    historical question for a current one.
+    """
+    if getattr(actor, "is_superuser", False):
+        return True
+    keys: list[str] = list(getattr(actor, "permission_keys", None) or ())
+    return permission in keys
 
 
 # -------------------------------------------------------------------- executing
 
 
+@_accepts_user_alias
 def transition(
     instance: models.Model,
     action: str,
     field_name: str = "status_key",
     *,
-    user: Any = None,
+    actor: Any = None,
     comment: str = "",
     metadata: Mapping[str, Any] | None = None,
     approval: Any = None,
@@ -378,7 +442,7 @@ def transition(
             f"{source.key} is a terminal state of {graph.machine_key}@{graph.version_label}."
         )
 
-    spec = _select(instance, found, user=user, metadata=metadata, enforce=enforce_permissions)
+    spec = _select(instance, found, actor=actor, metadata=metadata, enforce=enforce_permissions)
 
     if spec.requires_approval and approval is None:
         raise ApprovalRequired(
@@ -410,7 +474,7 @@ def transition(
             timing=timing,
             event=event,
             hook=hook,
-            actor=user,
+            actor=actor,
             params=hook.params,
             metadata=payload,
             record=record,
@@ -442,7 +506,7 @@ def transition(
                 version=version,
                 spec=spec,
                 from_key=from_key,
-                user=user,
+                actor=actor,
                 comment=comment,
                 metadata=payload,
                 approval=approval,
@@ -472,7 +536,7 @@ def _select(
     instance: models.Model,
     found: tuple[TransitionSpec, ...],
     *,
-    user: Any,
+    actor: Any,
     metadata: Mapping[str, Any] | None,
     enforce: bool,
 ) -> TransitionSpec:
@@ -485,7 +549,7 @@ def _select(
     first_error: StateMachineError | None = None
     for spec in found:
         try:
-            _assert_viable(instance, spec, user=user, metadata=metadata, enforce=enforce)
+            _assert_viable(instance, spec, actor=actor, metadata=metadata, enforce=enforce)
         except StateMachineError as exc:
             first_error = first_error or exc
             continue
@@ -498,7 +562,7 @@ def _assert_viable(
     instance: models.Model,
     spec: TransitionSpec,
     *,
-    user: Any,
+    actor: Any,
     metadata: Mapping[str, Any] | None,
     enforce: bool,
 ) -> None:
@@ -506,7 +570,7 @@ def _assert_viable(
     if (
         enforce
         and spec.required_permission
-        and not _has_permission(user, spec.required_permission, instance)
+        and not _has_permission(actor, spec.required_permission, instance)
     ):
         raise PermissionDenied(
             f"Transition {spec} requires the permission "
@@ -515,7 +579,7 @@ def _assert_viable(
     if not spec.guard:
         return
     try:
-        passed = evaluate(spec.guard, _guard_context(instance, spec, user, metadata))
+        passed = evaluate(spec.guard, _guard_context(instance, spec, actor, metadata))
     except GuardSyntaxError as exc:
         raise GuardFailed(
             f"Guard of transition {spec} could not be evaluated: {exc}", guard=spec.guard
@@ -569,7 +633,7 @@ def _write_history(
     version: StateMachineVersion,
     spec: TransitionSpec,
     from_key: str | None,
-    user: Any,
+    actor: Any,
     comment: str,
     metadata: Mapping[str, Any],
     approval: Any,
@@ -582,6 +646,9 @@ def _write_history(
     payload = dict(metadata)
     if approval is not None:
         payload.setdefault("approval", _describe(approval))
+    # Snapshotted here, inside the transaction that commits the move, so the identity
+    # and the history row it belongs to are written or rolled back together.
+    identity = resolve_identity(actor)
     return StatusTransition.objects.create(
         target_type=ContentType.objects.get_for_model(instance, for_concrete_model=False),
         target_id=str(instance.pk),
@@ -590,19 +657,14 @@ def _write_history(
         to_status_id=target.status_pk,
         state_machine_version=version,
         scope_id=graph.scope_pk,
+        scope_key=graph.scope_key,
         action_type_id=spec.action_pk,
         transition_id=spec.pk,
-        actor=user if _is_saved_user(user) else None,
+        actor=identity,
+        actor_type=identity.identity_type,
+        actor_key=identity.identity_key,
         comment=comment,
         metadata=payload,
-    )
-
-
-def _is_saved_user(user: Any) -> bool:
-    return (
-        isinstance(user, models.Model)
-        and user.pk is not None
-        and getattr(user, "is_authenticated", True)
     )
 
 

@@ -7,8 +7,8 @@ migrates or invalidates a single existing row.
 
 ```python
 risk = Risk.objects.create(title="Data retention")  # -> status_key "draft", pinned to v1
-risk.transition("risk.assess", user=request.user)  # -> "assessed", history row written
-risk.available_actions(user=request.user)  # -> ["risk.mitigate", "risk.reject"]
+risk.transition("risk.assess", actor=request.user)  # -> "assessed", history row written
+risk.available_actions(actor=request.user)  # -> ["risk.mitigate", "risk.reject"]
 ```
 
 ## Why
@@ -179,7 +179,7 @@ A new record pins the machine's `default_version` and starts on its initial stat
 `Risk.objects.create(title=...)` already lands somewhere valid.
 
 ```python
-transition(risk, "risk.assess", user=request.user, comment="Reviewed by security")
+transition(risk, "risk.assess", actor=request.user, comment="Reviewed by security")
 ```
 
 That single call, inside one transaction:
@@ -210,7 +210,7 @@ naturally through forms and serializers:
 For rendering a UI, ask for the blocked edges too and show why each one is unavailable:
 
 ```python
-for option in available_transitions(risk, user=request.user, include_blocked=True):
+for option in available_transitions(risk, actor=request.user, include_blocked=True):
     render(option.name, enabled=option.allowed, tooltip=option.reason)
 ```
 
@@ -402,7 +402,7 @@ Every handler takes one `SideEffectContext`:
 | `from_status`, `to_status`, `action` | the move; `from_status` is `None` on creation |
 | `version`, `graph`, `transition` | the authorizing version and the edge |
 | `timing`, `event`, `hook` | which binding fired |
-| `actor` | the acting principal, or `None` for the system |
+| `actor` | the live principal the caller passed, or `None` for the system |
 | `params` | the JSON parameter stored on this binding, verbatim |
 | `metadata` | whatever the caller passed to `transition()`, for this move |
 | `record` | the history row — set for `after` handlers only |
@@ -560,49 +560,174 @@ any of this exists.
 
 ### Pointing the scope at your own model
 
-`StateMachineScope` is **swappable**. Point it at your own tenant table and both scope
-foreign keys become real foreign keys to it, with real cascade:
+`StateMachineScope` is **swappable**. Subclass `AbstractStateMachineScope` over your own
+tenant table and every scope foreign key becomes a real foreign key to your model:
 
 ```python
 # settings.py — a top-level setting, because Meta.swappable resolves against one
-STATE_MACHINES_SCOPE_MODEL = "organizations.Organization"
+STATE_MACHINES_SCOPE_MODEL = "organizations.OrganizationScope"
 ```
 
 ```python
-class Organization(models.Model):
-    slug = models.SlugField(unique=True)
+from vinta_state_machines.enums import ScopeType
+from vinta_state_machines.models import AbstractStateMachineScope
+
+
+class OrganizationScope(AbstractStateMachineScope[Organization]):
+    """The adapter between the library and your own tenant table."""
+
+    organization = models.ForeignKey(Organization, null=True, blank=True, on_delete=models.PROTECT)
+
+    class Meta(AbstractStateMachineScope.Meta):
+        abstract = False
+        swappable = "STATE_MACHINES_SCOPE_MODEL"
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(scope_type=ScopeType.GLOBAL, organization__isnull=True)
+                    | ~models.Q(scope_type=ScopeType.GLOBAL) & models.Q(organization__isnull=False)
+                ),
+                name="scope_type_and_organization_agree",
+            ),
+            models.UniqueConstraint(
+                fields=("scope_type", "scope_key"), name="scope_unique_key_per_type"
+            ),
+        ]
 
     @property
-    def scope_key(self) -> str:
-        return f"org:{self.slug}"
+    def scope(self):
+        return self.organization
 
-    @classmethod
-    def from_scope_key(cls, key):
-        return cls.objects.filter(slug=key.removeprefix("org:")).first()
+    @scope.setter
+    def scope(self, value):
+        self.organization = value
+        self.scope_type = ScopeType.GLOBAL if value is None else ScopeType.SCOPED
+
+    @scope.deleter
+    def scope(self):
+        self.organization = None
+        self.scope_type = ScopeType.GLOBAL
+
+    def build_scope_key(self) -> str:
+        """Stable, portable, and "" for the global scope."""
+        return "" if self.organization_id is None else f"org:{self.organization.slug}"
 ```
 
-Those two members are the contract, and `manage.py check` enforces them
-(`state_machines.E005` / `E006`). They exist because primary keys do not travel between
-databases but keys do — they are what lets `export_state_machine --scope` write a machine
-in staging and `import_state_machine` read it back in production.
+Your own model stays a plain project model — the scope row is the adapter, so nothing
+from this library lands on `Organization` itself.
+
+`build_scope_key` is the contract, and `manage.py check` enforces it along with the base
+class (`state_machines.E005` / `E006`). It exists because primary keys do not travel
+between databases but keys do — it is what lets `export_state_machine --scope` write a
+machine in staging and `import_state_machine` read it back in production.
+
+The global scope is a **row**, not a `NULL`: `scope_type="global"` with an empty
+`scope_key`. It is created on first use, so there is nothing to seed. That is what keeps
+resolution a single code path and lets `StateMachine` carry one unique constraint per
+rule instead of a pair — a `NULL` does not compare equal to itself, so it slips past a
+plain unique index.
 
 Like every swappable model this is an **install-time, one-way decision**: make it before you
 have data, the way you would `AUTH_USER_MODEL`.
 
+## Actors and identities
+
+Every entry point takes an `actor`: whoever is trying to move the record.
+
+```python
+transition(risk, "risk.assess", actor=request.user)
+```
+
+The engine keeps that principal **live** while it is deciding — permissions and guards
+need something that can answer `has_perm` — and only **snapshots** it when it writes the
+move down. The history row points at an identity row holding the actor's label, groups
+and permissions *as they were at that moment*:
+
+```python
+record = transition(risk, "risk.reject", actor=request.user)
+record.actor.identity_label  # "ana", as it read then
+record.actor.permission_keys  # what she was allowed to do then
+record.actor_type, record.actor_key  # denormalised onto the row, for the index
+```
+
+That is one identity row **per move**, not per person: two transitions a month apart are
+two snapshots, because what the actor could do between them may differ. Revoking a
+permission does not rewrite what already happened, and deleting the user nulls
+`identity.user` while leaving the rest legible.
+
+Not every actor is a person. `actor=None` records a system identity — a real row, not a
+`NULL`, so every history row has an actor. For a principal this library cannot introspect
+— an API token, a webhook sender — pass a snapshot directly:
+
+```python
+from vinta_state_machines.enums import IdentityType
+from vinta_state_machines.types import IdentitySnapshot
+
+transition(
+    risk,
+    "risk.assess",
+    actor=IdentitySnapshot(
+        identity_type=IdentityType.SERVICE,
+        identity_key="billing-worker",
+        identity_label="Billing worker",
+    ),
+)
+```
+
+`StateMachine.author` and `StateMachineVersion.author` are the same kind of reference, so
+`publish_version(version, author=request.user)` records who published a graph and what
+they were allowed to do at the time.
+
+### Pointing the identity at your own model
+
+`StateMachineIdentity` is swappable on the same terms as the scope:
+
+```python
+STATE_MACHINES_IDENTITY_MODEL = "accounts.PrincipalIdentity"
+```
+
+```python
+from vinta_state_machines.models import AbstractStateMachineIdentity
+
+
+class PrincipalIdentity(AbstractStateMachineIdentity):
+    department = models.CharField(max_length=64, blank=True)
+
+    class Meta(AbstractStateMachineIdentity.Meta):
+        abstract = False
+        swappable = "STATE_MACHINES_IDENTITY_MODEL"
+
+    @classmethod
+    def from_snapshot(cls, snapshot):
+        row = super().from_snapshot(snapshot)
+        row.department = row.metadata.pop("department", "")
+        return row
+```
+
+`from_snapshot` is the hook: the library hands over a portable snapshot and your model
+decides what to promote into real columns. Whatever it leaves behind stays in `metadata`.
+
+Both models are shaped field-for-field like their counterparts in
+[vinta-django-audit-logs](https://github.com/vintasoftware/vinta-django-audit-logs), so a
+project running both can point `STATE_MACHINES_SCOPE_MODEL` and `AUDIT_SCOPE_MODEL` at
+one model of its own.
+
 ### What the scope buys on the history table
 
 `StatusTransition` carries the scope too, denormalised from the machine that authorized the
-move and indexed with `created_at`, so a tenant's audit trail is one indexed filter away
-rather than a scan:
+move — both as a foreign key and as a `scope_key` string, so the browse indexes stand on
+their own and a tenant's audit trail is one indexed filter away rather than a scan:
 
 ```python
-StatusTransition.objects.filter(scope=acme, created_at__gte=start)
+StatusTransition.objects.filter(scope_key="org:acme", created_at__gte=start)
+StatusTransition.objects.filter(  # everything one person did, in one tenant
+    scope_key="org:acme", actor_type="user", actor_key=str(user.pk)
+)
 ```
 
-The two foreign keys deliberately differ on `on_delete`: `CASCADE` on `StateMachine`,
-`PROTECT` on `StatusTransition`. Configuration is disposable; an audit trail should outlive
-the tenant it describes, so deleting an organization forces an explicit archival step rather
-than quietly destroying its history.
+Every scope and actor foreign key is `PROTECT`. An audit trail should outlive the tenant
+and the principal it describes, so deleting either forces an explicit archival step rather
+than quietly destroying history.
 
 ## History
 
@@ -634,17 +759,20 @@ STATE_MACHINES = {
     "ALLOW_GUARD_EXPRESSIONS": True,
     "MAX_GUARD_EXPRESSION_LENGTH": 1000,
     "TRANSITIONABLE_LIFECYCLES": ("published",),
-    "PERMISSION_CHECKER": None,  # dotted path to checker(user, perm, instance)
+    "PERMISSION_CHECKER": None,  # dotted path to checker(actor, perm, instance)
     "SCOPE_RESOLVER": None,  # dotted path to resolver(instance, config);
     # None disables tenancy entirely
+    "IDENTITY_RESOLVER": None,  # dotted path to resolver(actor) -> IdentitySnapshot
+    "CAPTURE_AUTHORIZATION_SNAPSHOT": True,  # record the actor's groups and permissions
 }
 ```
 
-One setting lives outside that dict, because `Meta.swappable` can only resolve against a
+Two settings live outside that dict, because `Meta.swappable` can only resolve against a
 top-level name:
 
 ```python
-STATE_MACHINES_SCOPE_MODEL = "organizations.Organization"  # defaults to the built-in
+STATE_MACHINES_SCOPE_MODEL = "organizations.OrganizationScope"  # defaults to built-in
+STATE_MACHINES_IDENTITY_MODEL = "accounts.PrincipalIdentity"  # defaults to built-in
 ```
 
 Graphs are cached per version and invalidated whenever any row of that version changes.

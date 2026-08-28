@@ -6,6 +6,60 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-28
+
+### Changed
+
+- **Breaking.** Scopes and actors now follow the same shape as
+  [vinta-django-audit-logs](https://github.com/vintasoftware/vinta-django-audit-logs), so a
+  project running both can point one model of its own at both libraries.
+- `StateMachineScope` is now `AbstractStateMachineScope` plus a concrete default. A swapped
+  in model subclasses the base and implements `build_scope_key()`; the old contract of a
+  `scope_key` property plus a `from_scope_key()` classmethod is gone, and `scope_key` is a
+  real indexed column. `state_machines.E006` now reports a missing `build_scope_key`.
+- The global scope is a **row** (`scope_type="global"`, empty `scope_key`) rather than a
+  `NULL`, created on first use. `StateMachine.scope` and `StatusTransition.scope` are
+  non-nullable, which collapses the four partial unique constraints on `StateMachine` to
+  two plain ones.
+- Every scope foreign key is `PROTECT`. `StateMachine.scope` was `CASCADE`, which meant
+  deleting a tenant tried to delete its machines and was then blocked by its history.
+- `StateMachine.author`, `StateMachineVersion.author` and `StatusTransition.actor` point at
+  the new identity model instead of `AUTH_USER_MODEL`. `StatusTransition.actor` is
+  non-nullable: a move nobody was behind carries a system identity rather than a `NULL`.
+- `transition()`, `can_transition()`, `available_transitions()` and `available_actions()`
+  take `actor=` instead of `user=`. `user=` still works and warns; it will be removed in
+  the next minor release. Guard expressions keep their `user` context key, and gain `actor`
+  alongside it.
+- `SideEffectContext.actor` is the live principal the caller passed. `after` handlers read
+  the recorded snapshot from `context.record.actor`.
+- Building a graph costs one extra query for the machine's scope when the caller has not
+  selected it. `with_graph()` and `get_graph()` already do; it is a constant, and graphs
+  are cached per version.
+- The migration history is squashed into a single `0001_initial`. This release predates any
+  production install, so there is no upgrade path from 0.1.0 — drop the tables and migrate
+  fresh.
+
+### Added
+
+- `STATE_MACHINES_IDENTITY_MODEL`, a swappable identity model on the `AUTH_USER_MODEL`
+  pattern, with `AbstractStateMachineIdentity` to subclass and a `from_snapshot()` hook for
+  filling columns of your own.
+- Identities are snapshots, one row per reference: the actor's label, groups and
+  permissions as they stood at that moment. Revoking a permission does not rewrite what
+  already happened, and deleting the user leaves the record legible.
+- `vinta_state_machines.types`: `ScopeRef`, `ScopeKey`, `IdentitySnapshot` and
+  `IdentityRef`, portable value objects that hold no rows. Pass an `IdentitySnapshot` as
+  the actor to record a principal this library cannot introspect — an API token, a webhook
+  sender.
+- `vinta_state_machines.identities`, the actor equivalent of `scopes`:
+  `identity_from_user`, `system_identity`, `snapshot_for`, `resolve_identity`.
+- `STATE_MACHINES["IDENTITY_RESOLVER"]` to replace how a principal becomes a snapshot, and
+  `STATE_MACHINES["CAPTURE_AUTHORIZATION_SNAPSHOT"]` to skip the group and permission reads.
+- `StatusTransition.scope_key`, `actor_type` and `actor_key`, denormalised so the browse
+  indexes need no join, plus an index on `(scope_key, actor_type, actor_key, -created_at)`.
+- `scopes.get_default_scope()`, and a `check_identity_model` system check
+  (`state_machines.E007` / `E008`).
+
 ## [0.1.0] - 2026-08-25
 
 First release under the `vinta-django-state-machines` name, superseding the
@@ -90,5 +144,6 @@ package; if this is your first install, only **Added** applies.
   leaving the same state, so the two sort identically; `define_machine` still numbers
   across the version.
 
-[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/vintasoftware/vinta-django-state-machines/releases/tag/v0.1.0

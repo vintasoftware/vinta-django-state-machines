@@ -84,7 +84,7 @@ def test_a_state_hook_must_not_also_name_a_transition(risk_version):
 def test_status_transitions_are_append_only(risk, user):
     from vinta_state_machines.engine import transition
 
-    record = transition(risk, "risk.assess", user=user)
+    record = transition(risk, "risk.assess", actor=user)
     record.comment = "tampering"
     with pytest.raises(ValueError, match="append-only"):
         record.save()
@@ -99,7 +99,7 @@ def test_action_type_keys_are_globally_unique():
 def test_history_queryset_filters_by_target(risk, user):
     from vinta_state_machines.engine import transition
 
-    transition(risk, "risk.assess", user=user)
+    transition(risk, "risk.assess", actor=user)
     assert StatusTransition.objects.for_object(risk).count() == 1
     assert StatusTransition.objects.entering("assessed").count() == 1
     assert StatusTransition.objects.leaving("draft").count() == 1

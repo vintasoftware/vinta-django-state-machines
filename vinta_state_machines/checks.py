@@ -108,38 +108,100 @@ def check_scope_model(app_configs: Any = None, **kwargs: Any) -> list[Any]:
     one back.  A replacement model that cannot do that round trip breaks the commands
     quietly, at the moment someone tries to move a machine between environments -- so it
     is worth failing at ``manage.py check`` instead.
+
+    Subclassing :class:`~vinta_state_machines.models.AbstractStateMachineScope` is the
+    whole contract: it brings the two columns the round trip needs, the invariant that
+    keeps them honest, and the ``build_scope_key`` hook a project fills in.
     """
+    from vinta_state_machines.models import AbstractStateMachineScope
     from vinta_state_machines.scopes import get_scope_model
 
-    model = get_scope_model()
+    return _check_swappable(
+        model=get_scope_model(),
+        base=AbstractStateMachineScope,
+        setting="STATE_MACHINES_SCOPE_MODEL",
+        error_id="state_machines.E005",
+        hook="build_scope_key",
+        hook_error_id="state_machines.E006",
+        hook_hint=(
+            "Return a stable string that identifies this scope, and '' for the global "
+            "scope:\n"
+            "    def build_scope_key(self) -> str:\n"
+            "        return '' if self.org_id is None else f'org:{self.org.slug}'"
+        ),
+    )
+
+
+@register("models")
+def check_identity_model(app_configs: Any = None, **kwargs: Any) -> list[Any]:
+    """A swapped in identity model has to be constructible from a snapshot.
+
+    Every actor this app records arrives as an
+    :class:`~vinta_state_machines.types.IdentitySnapshot` and is turned into a row by
+    the model's own ``from_snapshot``.  A replacement that does not inherit that
+    machinery fails at the first transition rather than at check time.
+    """
+    from vinta_state_machines.identities import get_identity_model
+    from vinta_state_machines.models import AbstractStateMachineIdentity
+
+    return _check_swappable(
+        model=get_identity_model(),
+        base=AbstractStateMachineIdentity,
+        setting="STATE_MACHINES_IDENTITY_MODEL",
+        error_id="state_machines.E007",
+        hook="from_snapshot",
+        hook_error_id="state_machines.E008",
+        hook_hint=(
+            "Inherit it from AbstractStateMachineIdentity, or override it to fill your "
+            "own columns:\n"
+            "    @classmethod\n"
+            "    def from_snapshot(cls, snapshot): ..."
+        ),
+    )
+
+
+def _check_swappable(
+    *,
+    model: type[models.Model],
+    base: type[models.Model],
+    setting: str,
+    error_id: str,
+    hook: str,
+    hook_error_id: str,
+    hook_hint: str,
+) -> list[Any]:
+    """The shared body of the two checks above: right base class, usable hook."""
     label = model._meta.label
-    issues: list[Any] = []
-    if not hasattr(model, "scope_key"):
-        issues.append(
+    if not issubclass(model, base):
+        return [
             Error(
-                f"{label} is the configured STATE_MACHINES_SCOPE_MODEL but has no 'scope_key'.",
+                f"{label} is the configured {setting} but does not subclass {base.__name__}.",
                 hint=(
-                    "Add a 'scope_key' property returning a stable string, e.g.\n"
-                    "    @property\n"
-                    "    def scope_key(self) -> str:\n"
-                    "        return f'org:{self.slug}'"
+                    f"Subclass it:\n"
+                    f"    from vinta_state_machines.models import {base.__name__}\n"
+                    f"    class {model.__name__}({base.__name__}): ..."
                 ),
                 obj=model,
-                id="state_machines.E005",
+                id=error_id,
             )
-        )
-    if not callable(getattr(model, "from_scope_key", None)):
-        issues.append(
+        ]
+    # Inherited from the abstract base, the hook raises NotImplementedError rather than
+    # being absent, so presence is not the question -- whether it was overridden is.
+    if getattr(model, hook, None) is getattr(base, hook, None) and _is_abstract_hook(base, hook):
+        return [
             Error(
-                f"{label} is the configured STATE_MACHINES_SCOPE_MODEL but has no "
-                "'from_scope_key' classmethod.",
-                hint=(
-                    "Add the inverse of 'scope_key', returning None when nothing matches:\n"
-                    "    @classmethod\n"
-                    "    def from_scope_key(cls, key): ..."
-                ),
+                f"{label} is the configured {setting} but does not implement {hook!r}.",
+                hint=hook_hint,
                 obj=model,
-                id="state_machines.E006",
+                id=hook_error_id,
             )
-        )
-    return issues
+        ]
+    return []
+
+
+def _is_abstract_hook(base: type[models.Model], hook: str) -> bool:
+    """Whether the base's version of ``hook`` is the one that just raises."""
+    func = getattr(base, hook, None)
+    func = getattr(func, "__func__", func)
+    code = getattr(func, "__code__", None)
+    return code is not None and "NotImplementedError" in (code.co_names or ())

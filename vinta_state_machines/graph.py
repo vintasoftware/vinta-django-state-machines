@@ -114,6 +114,9 @@ class VersionGraph:
     scope_pk: Any = None
     """The tenant this machine belongs to, carried so a history row can be stamped
     without re-reading the machine on every transition."""
+    scope_key: str = ""
+    """That tenant's portable key, carried for the same reason and denormalised onto
+    every history row so the browse index needs no join.  ``""`` is the global scope."""
     states: dict[str, StateSpec] = field(default_factory=dict)
     transitions: tuple[TransitionSpec, ...] = ()
     _by_source: dict[str | None, tuple[TransitionSpec, ...]] = field(default_factory=dict)
@@ -266,6 +269,7 @@ def build_graph(version: StateMachineVersion) -> VersionGraph:
         status_field=machine.status_field,
         modified_at=version.modified_at,
         scope_pk=machine.scope_id,
+        scope_key=machine.scope.scope_key,
         states=states,
         transitions=tuple(sorted(transitions, key=_edge_sort_key)),
         _by_source={
@@ -347,7 +351,7 @@ def get_graph(version: StateMachineVersion | int) -> VersionGraph:
     from vinta_state_machines.models import StateMachineVersion
 
     resolved = (
-        StateMachineVersion.objects.select_related("state_machine").get(pk=version)
+        StateMachineVersion.objects.select_related("state_machine__scope").get(pk=version)
         if isinstance(version, int)
         else version
     )

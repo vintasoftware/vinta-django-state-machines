@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 from django.apps import AppConfig
-from django.conf import settings
 from django.utils.translation import gettext_lazy as _
 
-from vinta_state_machines.conf import DEFAULT_SCOPE_MODEL, SCOPE_MODEL_SETTING
+from vinta_state_machines.conf import install_swappable_defaults
 
-# ``Meta.swappable`` resolves against a *top level* Django setting, and both scope
-# foreign keys are declared against this one, so it has to exist before the models are
-# imported.  Django imports every app's ``apps`` module in the first phase of
-# ``populate()`` -- before any model module -- which makes this the one place a default
-# can land without asking every existing project to declare a new setting.
-if not hasattr(settings, SCOPE_MODEL_SETTING):
-    setattr(settings, SCOPE_MODEL_SETTING, DEFAULT_SCOPE_MODEL)
+# ``Meta.swappable`` resolves against *top level* Django settings, and every scope and
+# actor foreign key in this app is declared against one of them, so both have to exist
+# before the models are imported.  Django imports every app's ``apps`` module in the
+# first phase of ``populate()`` -- before any model module -- which makes this the one
+# place a default can land without asking every existing project to declare two new
+# settings.  See the function's docstring for why ``ready()`` is too late.
+install_swappable_defaults()
 
 
 class StateMachinesConfig(AppConfig):

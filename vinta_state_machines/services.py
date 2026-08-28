@@ -18,6 +18,7 @@ from vinta_state_machines.exceptions import InvalidVersionState
 from vinta_state_machines.fields import get_status_field_config
 from vinta_state_machines.graph import CREATION, VersionGraph, build_graph, invalidate_graph
 from vinta_state_machines.guards import GuardSyntaxError, validate_guard
+from vinta_state_machines.identities import resolve_identity
 from vinta_state_machines.models import (
     ActionType,
     StateMachine,
@@ -192,7 +193,9 @@ def publish_version(
 
     version.mark_published(when=when or timezone.now())
     if author is not None and version.author_id is None:
-        version.author = author
+        # Snapshotted here rather than linked, so "who published this, and what were
+        # they allowed to do" stays answerable after their permissions change.
+        version.author = resolve_identity(author)
     version.save(update_fields=["lifecycle", "published_at", "author", "modified_at"])
     invalidate_graph(version.pk)
 
@@ -253,7 +256,7 @@ def clone_version(
         state_machine=version.state_machine,
         version=new_label,
         lifecycle=Lifecycle.DRAFT,
-        author=author,
+        author=None if author is None else resolve_identity(author),
         notes=notes,
     )
     state_map: dict[int, StateMachineState] = {}
@@ -375,11 +378,15 @@ def define_machine(definition: dict[str, Any], *, author: Any = None) -> StateMa
             "description": definition.get("description", ""),
         },
     )
+    identity = None if author is None else resolve_identity(author)
+    if identity is not None and machine.author_id is None:
+        machine.author = identity
+        machine.save(update_fields=["author", "modified_at"])
     version = StateMachineVersion.objects.create(
         state_machine=machine,
         version=str(definition.get("version", "1")),
         lifecycle=Lifecycle.DRAFT,
-        author=author,
+        author=identity,
         notes=definition.get("notes", ""),
     )
 

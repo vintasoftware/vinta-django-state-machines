@@ -14,6 +14,7 @@ from vinta_state_machines.engine import (
     resolve_version,
     transition,
 )
+from vinta_state_machines.enums import IdentityType
 from vinta_state_machines.exceptions import (
     ApprovalRequired,
     GuardFailed,
@@ -75,14 +76,14 @@ def test_initial_status_key_reads_the_lowest_ordered_initial_state(risk_version)
 
 
 def test_available_transitions_lists_only_what_this_caller_can_do(risk, user):
-    actions = {item.action for item in available_transitions(risk, user=user)}
+    actions = {item.action for item in available_transitions(risk, actor=user)}
     assert actions == {"risk.assess"}
 
 
 def test_blocked_transitions_can_be_listed_with_their_reason(risk, user):
     blocked = {
         item.action: item.reason
-        for item in available_transitions(risk, user=user, include_blocked=True)
+        for item in available_transitions(risk, actor=user, include_blocked=True)
         if not item.allowed
     }
     assert blocked == {"risk.discard": "requires approval"}
@@ -90,8 +91,8 @@ def test_blocked_transitions_can_be_listed_with_their_reason(risk, user):
 
 def test_a_terminal_state_offers_nothing(risk, privileged_user):
     transition(risk, "risk.assess")
-    transition(risk, "risk.reject", user=privileged_user)
-    assert available_actions(risk, user=privileged_user) == []
+    transition(risk, "risk.reject", actor=privileged_user)
+    assert available_actions(risk, actor=privileged_user) == []
 
 
 def test_can_transition_is_true_for_an_edge_that_only_awaits_approval(risk):
@@ -118,7 +119,7 @@ def test_a_transition_moves_the_record_and_persists_it(risk):
 
 
 def test_a_transition_writes_one_history_row(risk, user):
-    record = transition(risk, "risk.assess", user=user, comment="reviewed")
+    record = transition(risk, "risk.assess", actor=user, comment="reviewed")
     assert isinstance(record, StatusTransition)
     assert record.from_status.key == "draft"
     assert record.to_status.key == "assessed"
@@ -147,7 +148,7 @@ def test_an_undeclared_action_is_refused_and_lists_what_is_available(risk):
 
 def test_a_terminal_state_has_nowhere_to_go(risk, privileged_user):
     transition(risk, "risk.assess")
-    transition(risk, "risk.reject", user=privileged_user)
+    transition(risk, "risk.reject", actor=privileged_user)
     with pytest.raises(TransitionNotAllowed, match="Available from here: <none>"):
         transition(risk, "risk.assess")
 
@@ -189,12 +190,12 @@ def test_a_passing_guard_lets_the_move_through(risk):
 def test_a_required_permission_is_enforced(risk, user):
     transition(risk, "risk.assess")
     with pytest.raises(PermissionDenied, match="testapp.change_risk"):
-        transition(risk, "risk.reject", user=user)
+        transition(risk, "risk.reject", actor=user)
 
 
 def test_a_user_holding_the_permission_may_proceed(risk, privileged_user):
     transition(risk, "risk.assess")
-    transition(risk, "risk.reject", user=privileged_user)
+    transition(risk, "risk.reject", actor=privileged_user)
     assert risk.status_key == "rejected"
 
 
@@ -244,8 +245,72 @@ def test_metadata_travels_into_the_history_row(risk):
 def test_an_anonymous_actor_is_recorded_as_the_system(risk):
     from django.contrib.auth.models import AnonymousUser
 
-    record = transition(risk, "risk.assess", user=AnonymousUser())
-    assert record.actor_id is None
+    record = transition(risk, "risk.assess", actor=AnonymousUser())
+    # A real identity row rather than a NULL, so every history row has an actor and the
+    # browse index never has to reason about a missing one.
+    assert record.actor.identity_type == IdentityType.SYSTEM
+    assert record.actor.identity_key == ""
+    assert record.actor.user_id is None
+    assert record.actor_type == IdentityType.SYSTEM
+
+
+def test_a_named_actor_is_snapshotted_rather_than_linked(risk, privileged_user):
+    """The history keeps what the actor could do then, not what they can do now."""
+    transition(risk, "risk.assess")
+    record = transition(risk, "risk.reject", actor=privileged_user)
+
+    assert record.actor.identity_type == IdentityType.USER
+    assert record.actor.identity_key == str(privileged_user.pk)
+    assert record.actor.identity_label == "bo"
+    assert record.actor.user_id == privileged_user.pk
+    assert "testapp.change_risk" in record.actor.permission_keys
+    # Denormalised onto the row itself, which is what the browse index is built on.
+    assert (record.actor_type, record.actor_key) == (IdentityType.USER, str(privileged_user.pk))
+
+    # Taking the permission away does not rewrite what already happened.
+    privileged_user.user_permissions.clear()
+    record.refresh_from_db()
+    assert "testapp.change_risk" in record.actor.permission_keys
+
+
+def test_deleting_the_user_leaves_the_actor_legible(risk, user):
+    record = transition(risk, "risk.assess", actor=user)
+    label, key = record.actor.identity_label, record.actor.identity_key
+
+    user.delete()
+
+    record.refresh_from_db()
+    assert record.actor.user_id is None
+    assert (record.actor.identity_label, record.actor.identity_key) == (label, key)
+
+
+def test_two_moves_by_one_person_are_two_snapshots(risk, user):
+    """One row per reference, not per principal: the second move may differ."""
+    first = transition(risk, "risk.assess", actor=user)
+    second = transition(risk, "risk.mitigate", actor=user)
+
+    assert first.actor_id != second.actor_id
+    assert first.actor.identity_key == second.actor.identity_key
+
+
+def test_passing_a_saved_identity_reuses_it(risk, user):
+    """Two transitions can be tied to one snapshot by passing the row back in."""
+    first = transition(risk, "risk.assess", actor=user)
+    second = transition(risk, "risk.mitigate", actor=first.actor)
+
+    assert second.actor_id == first.actor_id
+
+
+def test_the_deprecated_user_kwarg_still_works(risk, user):
+    with pytest.warns(DeprecationWarning, match="use actor="):
+        # The signature no longer advertises it, which is the point of the shim.
+        record = transition(risk, "risk.assess", user=user)  # type: ignore[call-arg]
+    assert record.actor.identity_key == str(user.pk)
+
+
+def test_passing_both_actor_and_user_is_an_error(risk, user):
+    with pytest.raises(TypeError, match="Pass only 'actor'"):
+        transition(risk, "risk.assess", actor=user, user=user)  # type: ignore[call-arg]
 
 
 def test_publishing_a_new_version_leaves_existing_records_on_the_old_graph(risk_machine, risk):

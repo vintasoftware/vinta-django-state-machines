@@ -99,9 +99,12 @@ def _serialize(machine: StateMachine, version: StateMachineVersion) -> dict[str,
         version.transitions.select_related("action_type", "from_state__status", "to_state__status")
     )
     payload: dict[str, Any] = {"key": machine.key}
-    scope = machine.scope
-    if scope is not None:
-        payload["scope"] = scope.scope_key
+    # Omitted for the global machine rather than written as "". A definition with no
+    # tenant is the portable one -- it imports into whatever the target install calls
+    # its global scope -- and an empty string in the file would only invite someone to
+    # treat "" as a tenant name.
+    if not machine.scope.is_global:
+        payload["scope"] = machine.scope.scope_key
     return {
         **payload,
         "entity_type": machine.entity_type,

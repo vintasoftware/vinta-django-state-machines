@@ -8,6 +8,13 @@ declares one setting::
         "STRICT": False,
         "PERMISSION_CHECKER": "myproject.perms.can_transition",
     }
+
+The two *model* settings are the exception. ``Meta.swappable`` resolves against a top
+level name, so they are declared alongside ``AUTH_USER_MODEL`` rather than inside the
+dict::
+
+    STATE_MACHINES_SCOPE_MODEL = "organizations.OrganizationScope"
+    STATE_MACHINES_IDENTITY_MODEL = "accounts.PrincipalIdentity"
 """
 
 from __future__ import annotations
@@ -21,16 +28,53 @@ from django.utils.module_loading import import_string
 
 SETTINGS_KEY = "STATE_MACHINES"
 
-# The scope model is swappable, and ``Meta.swappable`` resolves against a *top level*
-# setting rather than a key inside ``STATE_MACHINES``. ``apps.py`` gives it a default
-# before the models are imported.
+# The scope and identity models are swappable, and ``Meta.swappable`` resolves against a
+# *top level* setting rather than a key inside ``STATE_MACHINES``.
+# :func:`install_swappable_defaults` gives both a default before the models are imported.
 SCOPE_MODEL_SETTING = "STATE_MACHINES_SCOPE_MODEL"
 DEFAULT_SCOPE_MODEL = "state_machines.StateMachineScope"
 
+IDENTITY_MODEL_SETTING = "STATE_MACHINES_IDENTITY_MODEL"
+DEFAULT_IDENTITY_MODEL = "state_machines.StateMachineIdentity"
+
+SWAPPABLE_DEFAULTS: tuple[tuple[str, str], ...] = (
+    (SCOPE_MODEL_SETTING, DEFAULT_SCOPE_MODEL),
+    (IDENTITY_MODEL_SETTING, DEFAULT_IDENTITY_MODEL),
+)
+
+
+def install_swappable_defaults() -> None:
+    """Give the two swappable model settings a default, if the project has not.
+
+    ``Meta.swappable`` is not an ordinary setting lookup. Django's migration
+    autodetector reads the named setting with a bare ``getattr(settings, name)`` and
+    lets the ``AttributeError`` escape, which is why ``AUTH_USER_MODEL`` -- the pattern
+    this follows -- is declared in ``django.conf.global_settings``. A third party app
+    cannot add to that module, so the default has to be put into the project's settings.
+
+    Timing is what makes this work, and why it is called at import time in ``apps.py``
+    rather than from ``AppConfig.ready``. ``apps.populate`` runs in two phases: it builds
+    every ``AppConfig`` first (importing each app module and its ``apps`` module), and
+    only then imports any models. So this has already run by the time a field definition
+    or the autodetector asks for either setting; ``ready()`` would be far too late.
+
+    A project that *has* set either one is left alone -- these are defaults, not
+    overrides.
+    """
+    for name, default in SWAPPABLE_DEFAULTS:
+        if not hasattr(settings, name):
+            setattr(settings, name, default)
+
 
 def scope_model_path() -> str:
-    """Dotted ``app_label.ModelName`` of the model both scope foreign keys point at."""
+    """Dotted ``app_label.ModelName`` of the model every scope foreign key points at."""
     value: str = getattr(settings, SCOPE_MODEL_SETTING, DEFAULT_SCOPE_MODEL)
+    return value
+
+
+def identity_model_path() -> str:
+    """Dotted ``app_label.ModelName`` of the model every actor foreign key points at."""
+    value: str = getattr(settings, IDENTITY_MODEL_SETTING, DEFAULT_IDENTITY_MODEL)
     return value
 
 
@@ -47,6 +91,11 @@ DEFAULTS: dict[str, Any] = {
     # which decides whose machine governs a record.  ``None`` disables tenancy: every
     # record resolves to the global machine.
     "SCOPE_RESOLVER": None,
+    # Dotted path to ``resolver(actor) -> IdentitySnapshot``, which decides how an
+    # acting principal is snapshotted onto the rows that record it.  ``None`` uses
+    # ``vinta_state_machines.identities.identity_from_actor``, which understands a
+    # Django user, an identity row, an existing snapshot, and ``None``.
+    "IDENTITY_RESOLVER": None,
     # Allow ``guard`` expressions to be evaluated.  Disable to only permit guards
     # registered by name through ``@register_guard``.
     "ALLOW_GUARD_EXPRESSIONS": True,
@@ -54,13 +103,18 @@ DEFAULTS: dict[str, Any] = {
     "MAX_GUARD_EXPRESSION_LENGTH": 1000,
     # Write a ``StatusTransition`` row for every successful transition.
     "RECORD_HISTORY": True,
+    # Capture the actor's groups and permissions onto the identity recorded with each
+    # move.  Costs up to two extra queries per transition -- often one, since a
+    # transition guarded by a permission has already warmed the backend's cache.  Turn
+    # off to keep only the columns that identify the actor.
+    "CAPTURE_AUTHORIZATION_SNAPSHOT": True,
     # Keep parsed version graphs in memory. Turn off in tests that recycle pks.
     "CACHE_GRAPHS": True,
     # Lifecycle values a version must have for records to transition under it.
     "TRANSITIONABLE_LIFECYCLES": ("published",),
 }
 
-_IMPORT_STRINGS = frozenset({"PERMISSION_CHECKER", "SCOPE_RESOLVER"})
+_IMPORT_STRINGS = frozenset({"PERMISSION_CHECKER", "SCOPE_RESOLVER", "IDENTITY_RESOLVER"})
 
 _cache: dict[str, Any] = {}
 

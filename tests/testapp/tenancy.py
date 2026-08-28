@@ -9,15 +9,22 @@ from __future__ import annotations
 
 from typing import Any
 
+from vinta_state_machines.enums import ScopeType
 from vinta_state_machines.models import StateMachineScope
 
 
 def scope_for_owner(instance: Any, config: Any) -> Any:
-    """Map ``instance.owner_id`` onto a scope, or ``None`` for an unowned record."""
+    """Map ``instance.owner_id`` onto a scope, or ``None`` for an unowned record.
+
+    ``None`` means "this record has no tenant", which the engine reads as a fallback to
+    the global machine -- not as the global scope row itself.
+    """
     owner_id = getattr(instance, "owner_id", None)
     if owner_id is None:
         return None
-    return StateMachineScope.objects.filter(key=f"org.{owner_id}").first()
+    return StateMachineScope.objects.filter(
+        scope_type=ScopeType.SCOPED, scope_key=f"org.{owner_id}"
+    ).first()
 
 
 def scope_key_for_owner(instance: Any, config: Any) -> Any:
