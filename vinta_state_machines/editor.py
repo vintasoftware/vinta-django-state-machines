@@ -31,7 +31,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from django.db import transaction
-from django.db.models import ProtectedError
+from django.db.models import Count, ProtectedError
 from django.utils.text import slugify
 
 from vinta_state_machines.enums import HookEvent, HookTiming, StateColor
@@ -58,7 +58,10 @@ __all__ = [
     "EditorPayloadError",
     "action_catalog",
     "apply_editor_machine",
+    "check_editor_machine",
     "check_guard",
+    "editor_machine_template",
+    "empty_editor_machine",
     "side_effect_definitions",
     "to_editor_machine",
 ]
@@ -167,6 +170,57 @@ def to_editor_machine(version: StateMachineVersion) -> dict[str, Any]:
     }
 
 
+def empty_editor_machine(machine: StateMachine | None = None) -> dict[str, Any]:
+    """The document a canvas with nothing on it hands back.
+
+    What the **add** form of a machine starts from: there is no version to serialize
+    yet, and an editor assigned nothing at all would refuse the assignment.
+    """
+    return {
+        "states": [],
+        "transitions": [],
+        "initialStateIds": [],
+        "finalStateIds": [],
+        "data": {} if machine is None else {"machine": machine.key},
+    }
+
+
+def editor_machine_template(machine: StateMachine) -> dict[str, Any]:
+    """The document a *new* version of ``machine`` starts from.
+
+    Its newest version's graph, so authoring version *n+1* starts from version *n*
+    rather than from an empty canvas — the same move :func:`clone_version` makes for
+    a version that already exists.
+
+    "Newest" skips the versions with nothing on them.  A draft filed and never drawn
+    is not what anybody means by *the previous setup*, and seeding from it would hand
+    back the empty canvas this exists to avoid.
+
+    Every row id is blanked first.  A state keeps its id, which is its vocabulary key
+    and is shared across versions by design; a transition's and a side effect's are
+    primary keys of rows belonging to the version it came from, and this document is
+    going to be reconciled into a different one, where they mean nothing.
+    """
+    previous = (
+        machine.versions.annotate(_states=Count("states"))
+        .filter(_states__gt=0)
+        .order_by("-created_at", "-pk")
+        .first()
+    )
+    if previous is None:
+        return empty_editor_machine(machine)
+    document = to_editor_machine(previous)
+    for index, edge in enumerate(document["transitions"]):
+        edge["id"] = f"{TRANSITION_ID_PREFIX}{index}"
+    for _kind, _owner, _timing, effects in _iter_effect_lists(
+        document["states"], document["transitions"]
+    ):
+        for index, effect in enumerate(effects):
+            effect["id"] = f"{EFFECT_ID_PREFIX}{index}"
+    document["data"] = {"machine": machine.key}
+    return document
+
+
 # ----------------------------------------------------------------------- catalogs
 
 
@@ -272,6 +326,75 @@ def _iter_effect_lists(
             effects = hooks.get(timing)
             if isinstance(effects, list):
                 yield "transition", edge, timing, effects
+
+
+def check_editor_machine(payload: Any) -> list[str]:
+    """Every reason :func:`apply_editor_machine` would refuse ``payload``, read off the
+    document alone.
+
+    The rules that need the database are all about rows that are already there — an
+    edge recorded history points at, a status key another version spelled differently
+    — and a version that has just been created has none.  So for a **new** version
+    this is the whole list, which is what lets the admin's add forms reject a graph
+    while the person who drew it can still fix it, rather than after the version it
+    was drawn for has been saved.
+
+    Kept deliberately separate from :func:`apply_editor_machine` rather than wired
+    into it: reconciling an existing draft is a settled path, and a pre-flight that
+    turned out stricter than the reconciliation would start refusing documents that
+    used to apply cleanly.  ``test_editor`` holds the two to the same answers.
+    """
+    if not isinstance(payload, dict):
+        return ["The machine must be an object."]
+
+    errors: list[str] = []
+    state_specs = _dicts(payload.get("states"), "machine.states", errors)
+    edge_specs = _dicts(payload.get("transitions"), "machine.transitions", errors)
+    _as_list(payload.get("initialStateIds"), "initialStateIds", errors)
+    _as_list(payload.get("finalStateIds"), "finalStateIds", errors)
+    if errors:
+        return errors
+
+    colors = set(StateColor.values)
+    taken: set[str] = set()
+    state_ids: set[str] = set()
+    for spec in state_specs:
+        key = _status_key(spec, taken)
+        taken.add(key)
+        state_ids.add(str(spec.get("id") or key))
+        if not re.match(KEY_REGEX, key):
+            errors.append(f"{key!r} cannot be used as a status key.")
+        color = spec.get("color", StateColor.NEUTRAL)
+        if color not in colors:
+            errors.append(f"State {key!r} has the unknown colour {color!r}.")
+
+    for spec in edge_specs:
+        name = str(spec.get("name") or "").strip()
+        if not name:
+            errors.append("Every transition needs a name.")
+            continue
+        source_id = spec.get("from")
+        if source_id is not None and source_id not in state_ids:
+            errors.append(f"Transition {name!r} leaves a state that is not in the document.")
+            continue
+        if spec.get("to") not in state_ids:
+            errors.append(f"Transition {name!r} points at a state that is not in the document.")
+            continue
+        trigger = spec.get("trigger")
+        if not isinstance(trigger, dict) or not trigger.get("id"):
+            errors.append(f"Transition {name!r} has no trigger; pick an action for it.")
+            continue
+        verdict = check_guard(str(spec.get("guard") or ""))
+        if not verdict["ok"]:
+            errors.append(f"Guard of transition {name!r} is unusable: {verdict['errors'][0]}")
+
+    for _kind, _owner, _timing, effects in _iter_effect_lists(state_specs, edge_specs):
+        for spec in effects:
+            if not isinstance(spec, dict):
+                errors.append("Every side effect must be an object.")
+            elif not spec.get("definitionId"):
+                errors.append("A side effect is missing the key of its handler.")
+    return errors
 
 
 @transaction.atomic

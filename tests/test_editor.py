@@ -10,7 +10,10 @@ from vinta_state_machines.editor import (
     EditorPayloadError,
     action_catalog,
     apply_editor_machine,
+    check_editor_machine,
     check_guard,
+    editor_machine_template,
+    empty_editor_machine,
     side_effect_definitions,
     to_editor_machine,
 )
@@ -401,3 +404,122 @@ def test_applying_leaves_no_orphan_rows(risk_draft, machine):
     assert StateMachineState.objects.count() == len(machine["states"])
     assert StateMachineTransition.objects.count() == len(machine["transitions"])
     assert ActionType.objects.count() == 5
+
+
+# ------------------------------------------------------- checking without saving
+
+
+def refused_by_apply(version, document) -> list[str]:
+    """Whatever ``apply_editor_machine`` would say about ``document``."""
+    with pytest.raises(EditorPayloadError) as caught:
+        apply_editor_machine(version, document)
+    return caught.value.errors
+
+
+def test_a_document_that_applies_cleanly_is_checked_clean(machine):
+    assert check_editor_machine(machine) == []
+    assert check_editor_machine(empty_editor_machine()) == []
+
+
+def test_the_check_and_the_reconciliation_agree_on_every_refusal(risk_draft, machine):
+    broken = {
+        "no trigger": lambda doc: edge_of(doc, "assess").__setitem__("trigger", None),
+        "unusable guard": lambda doc: edge_of(doc, "assess").__setitem__(
+            "guard", "obj.amount ==="
+        ),
+        "unknown colour": lambda doc: state_of(doc, "draft").__setitem__("color", "chartreuse"),
+        "nameless edge": lambda doc: edge_of(doc, "assess").__setitem__("name", "  "),
+        "dangling edge": lambda doc: edge_of(doc, "assess").__setitem__("to", "nowhere"),
+        "handlerless effect": lambda doc: state_of(doc, "draft")["onEnter"]["before"].append(
+            {"id": "effect_1", "name": "?", "params": {}, "enabled": True, "data": {}}
+        ),
+    }
+    for label, break_it in broken.items():
+        document = copy.deepcopy(machine)
+        break_it(document)
+        assert check_editor_machine(document) == refused_by_apply(risk_draft, document), label
+
+
+def test_a_document_that_is_not_an_object_is_refused_by_both(risk_draft):
+    assert check_editor_machine("nope") == ["The machine must be an object."]
+    assert refused_by_apply(risk_draft, "nope") == ["The machine must be an object."]
+
+
+def test_the_check_never_writes_anything(risk_draft, machine):
+    document = copy.deepcopy(machine)
+    document["states"].append(
+        {
+            "id": "state_new",
+            "name": "Brand new",
+            "position": {"x": 0, "y": 0},
+            "onEnter": {"before": [], "after": []},
+            "onLeave": {"before": [], "after": []},
+            "data": {},
+        }
+    )
+    before = StatusDefinition.objects.count()
+
+    assert check_editor_machine(document) == []
+    assert StatusDefinition.objects.count() == before
+
+
+# ---------------------------------------------------------------- seed documents
+
+
+def test_an_empty_document_stamps_the_machine_it_is_for(risk_machine):
+    assert empty_editor_machine()["data"] == {}
+    assert empty_editor_machine(risk_machine)["data"] == {"machine": "risk.status"}
+
+
+def test_the_template_is_the_latest_version_with_its_row_ids_blanked(risk_machine):
+    previous = risk_machine.versions.get()
+    template = editor_machine_template(risk_machine)
+    document = to_editor_machine(previous)
+
+    assert template["states"] == document["states"]
+    assert [edge["name"] for edge in template["transitions"]] == [
+        edge["name"] for edge in document["transitions"]
+    ]
+    assert all(edge["id"].startswith("transition_") for edge in template["transitions"])
+    assert template["data"] == {"machine": "risk.status"}
+
+
+def test_the_template_of_a_machine_with_no_version_is_an_empty_canvas(db, risk_machine):
+    from vinta_state_machines.models import StateMachine
+
+    fresh = StateMachine.objects.create(
+        key="order.status",
+        entity_type="order",
+        status_field="status",
+        scope=risk_machine.scope,
+        name="Order status",
+    )
+    assert editor_machine_template(fresh) == empty_editor_machine(fresh)
+
+
+def test_the_template_applies_onto_a_new_version_as_a_copy(risk_machine):
+    from vinta_state_machines.models import StateMachineVersion
+
+    template = editor_machine_template(risk_machine)
+    fresh = StateMachineVersion.objects.create(state_machine=risk_machine, version="2")
+    apply_editor_machine(fresh, template)
+
+    previous = risk_machine.versions.get(version="1")
+    assert fresh.states.count() == previous.states.count()
+    assert fresh.transitions.count() == previous.transitions.count()
+    assert previous.transitions.exclude(state_machine_version=previous).count() == 0
+
+
+def test_a_draft_nobody_drew_on_is_not_what_the_next_version_starts_from(risk_machine):
+    """An empty version filed after the real one must not become the template."""
+    from vinta_state_machines.models import StateMachineVersion
+
+    StateMachineVersion.objects.create(state_machine=risk_machine, version="2")
+
+    template = editor_machine_template(risk_machine)
+    assert [state["id"] for state in template["states"]] == [
+        "draft",
+        "assessed",
+        "mitigated",
+        "rejected",
+    ]

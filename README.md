@@ -476,6 +476,51 @@ there is no npm install and no build step — only `django.contrib.staticfiles` 
 The canvas edits **drafts**. A published or archived version renders read only, exactly as
 its form fields do, because records pin it and its graph can no longer change.
 
+### Creating a machine and its first version together
+
+A machine on its own governs nothing — every state and transition lives on a version — so
+**Add state machine** asks for the machine's fields, the label of its first version, and the
+graph, all on one form. One save creates the machine, files the version as a draft and
+applies what was drawn.
+
+The scope select may be left empty there: an empty scope is the **global** machine, the
+fallback every tenant without one of its own uses, and its row is created on demand. A
+project that has never created a scope can therefore author its first machine without
+visiting another form first.
+
+### Starting a new version from the previous one
+
+**Add state machine version** carries the same canvas, seeded with the machine's newest
+non-empty version. Authoring version *n+1* is editing version *n*, which is what a new
+version almost always is — the same move [`clone_version`](#versioning) makes from code, and
+the graph is still yours to change before anything is saved.
+
+Picking a different machine reloads the canvas from that machine instead. The document is
+stamped with the machine it was drawn for, so a graph and a machine that no longer agree is
+refused rather than filed under the wrong key.
+
+New versions are always drafts: `lifecycle` is not on the add form, because a published
+version would refuse the very graph the form exists to apply. Publish from the changelist
+action once the graph is what you want.
+
+On these two forms the graph travels **with the form** rather than on its own endpoint —
+there is no row yet to hang one off — so there is no *Save graph* button, and the form's own
+Save is what stores it. A document the server refuses comes back on the form with the reason
+above the canvas and the graph still on it, rather than after the row has been created.
+
+### Cards nobody has placed
+
+A graph that never came from the canvas — one seeded by `define_machine`, imported, or
+written in a data migration — usually has no coordinates, so every card sits at `(0, 0)`.
+The editor notices and **organizes the layout** before drawing: columns left to right, one
+per step away from where a record enters the machine, with the states in a column ordered so
+the edges between them cross as little as possible. Pressing **Organize** in the toolbar does
+the same thing on demand, whatever the graph looks like.
+
+The layout is a change like any other, so on a draft it is offered as unsaved work: press
+**Save graph** and the positions are stored on the states, and the next visit draws exactly
+what you left.
+
 What each side calls things:
 
 | On the canvas | In the database |
@@ -527,6 +572,23 @@ apply_editor_machine(version, document)  # <- reconcile a posted one, in one tra
 the history pointing at them — survive an edit. It raises `EditorPayloadError`, which
 carries **every** problem it found rather than only the first, and rolls the whole document
 back if any of them fire.
+
+Three more, for a canvas on a form rather than on a saved row:
+
+```python
+from vinta_state_machines.editor import (
+    check_editor_machine,  # every reason a document would be refused, without saving
+    editor_machine_template,  # the document a new version of a machine starts from
+    empty_editor_machine,  # a canvas with nothing on it
+)
+
+errors = check_editor_machine(document)  # -> [] when it would apply cleanly
+```
+
+`check_editor_machine` reads the document alone. The rules it cannot check are all about
+rows that are already there — an edge recorded history points at — and a version that has
+just been created has none, so for a **new** version it is the whole list. That is what lets
+the add forms refuse a graph while the person who drew it can still fix it.
 
 ## Per-tenant machines
 

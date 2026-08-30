@@ -114,22 +114,19 @@ def test_malformed_json_is_rejected(as_staff, risk_draft):
 
 def test_the_catalogs_are_served(as_staff, risk_draft):
     handlers = as_staff.get(
-        reverse(
-            "admin:state_machines_statemachineversion_editor_side_effects",
-            args=[risk_draft.pk],
-        )
+        reverse("admin:state_machines_statemachineversion_editor_side_effects")
     ).json()
     assert {entry["id"] for entry in handlers} >= {"testapp.record"}
     assert all({"id", "name", "description", "defaultParams"} <= set(entry) for entry in handlers)
 
     actions = as_staff.get(
-        reverse("admin:state_machines_statemachineversion_editor_actions", args=[risk_draft.pk])
+        reverse("admin:state_machines_statemachineversion_editor_actions")
     ).json()
     assert {entry["id"] for entry in actions} >= {"risk.assess"}
 
 
 def test_the_guard_validator_answers_both_ways(as_staff, risk_draft):
-    url = reverse("admin:state_machines_statemachineversion_editor_guard", args=[risk_draft.pk])
+    url = reverse("admin:state_machines_statemachineversion_editor_guard")
     ok = as_staff.post(
         url, data=json.dumps({"expression": "obj.amount <= 10"}), content_type="application/json"
     )

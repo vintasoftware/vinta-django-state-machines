@@ -4,6 +4,16 @@
 // the component itself: the machine document, the side-effect and action catalogs and
 // the guard validator all come from endpoints on this ModelAdmin, whose URLs are on
 // the container's data attributes.
+//
+// Two modes, told apart by which of those attributes are set:
+//
+// * `machine-url` — a saved version. The graph is loaded from that endpoint and
+//   posted back to it by the "Save graph" button, independently of the form.
+// * `field` — an add form, for a row that does not exist yet. The document rides
+//   along in the hidden field of that name and the form's own Save applies it, so
+//   there is nothing of ours to press. `template-url` plus `source-field` seed the
+//   canvas from the machine picked in that select — a new version starts from the
+//   previous one rather than from an empty canvas.
 import './state-machine-editor.js';
 
 const container = document.getElementById('dsm-editor');
@@ -12,6 +22,9 @@ if (container) {
   const saveButton = container.querySelector('[data-dsm-save]');
   const status = container.querySelector('[data-dsm-status]');
   const readOnly = container.dataset.readonly === '1';
+  const field = container.dataset.field
+    ? document.querySelector(`[name="${container.dataset.field}"]`)
+    : null;
 
   const url = (name) => container.dataset[name];
   const csrf = () =>
@@ -50,19 +63,106 @@ if (container) {
 
   let dirty = false;
 
-  getJson(url('machineUrl'))
-    .then((machine) => {
-      editor.value = machine;
-      editor.zoomToFit();
-      say('');
-    })
-    .catch((error) => say(`Could not load the graph: ${error.message}`, 'error'));
+  // -- form mode: the document is a field of the form ------------------------
+
+  const seedElement = document.getElementById('dsm-editor-seed');
+  const seed = seedElement ? JSON.parse(seedElement.textContent) : null;
+
+  const parseField = () => {
+    if (!field || !field.value.trim()) return null;
+    try {
+      return JSON.parse(field.value);
+    } catch {
+      return null;
+    }
+  };
+
+  const mirror = () => {
+    if (field) field.value = JSON.stringify(editor.value);
+  };
+
+  const show = (machine) => {
+    editor.value = machine;
+    editor.zoomToFit();
+    mirror();
+  };
+
+  /** The machine whose latest version a new one is drawn from, if one is picked. */
+  const sourceSelect = container.dataset.sourceField
+    ? document.getElementById(container.dataset.sourceField)
+    : null;
+
+  // Which machine the canvas is currently showing, so a pick announced twice —
+  // see below — is fetched once.
+  let showing = null;
+
+  const loadTemplate = async () => {
+    const chosen = sourceSelect ? sourceSelect.value : '';
+    if (!url('templateUrl') || chosen === showing) return;
+    showing = chosen;
+    try {
+      const target = `${url('templateUrl')}?state_machine=${encodeURIComponent(chosen)}`;
+      show(await getJson(target));
+      say(
+        chosen
+          ? 'Starting from the latest version of this machine.'
+          : 'Draw the graph here; it is saved with the rest of the form.',
+      );
+    } catch (error) {
+      showing = null; // Let the next pick — or the same one again — retry.
+      say(`Could not load the previous version: ${error.message}`, 'error');
+    }
+  };
+
+  if (field) {
+    // What the form came back with wins over any template: a redisplayed form is
+    // one somebody's graph was refused on, and re-seeding would throw it away.
+    const posted = parseField();
+    if (posted) {
+      show(posted);
+    } else if (sourceSelect && sourceSelect.value) {
+      loadTemplate();
+    } else if (seed) {
+      show(seed);
+    }
+    if (sourceSelect) {
+      sourceSelect.addEventListener('change', loadTemplate);
+      // The admin renders a foreign key listed in `autocomplete_fields` as a
+      // select2 widget, which announces a pick by triggering jQuery's own change
+      // rather than dispatching a DOM event anything else can hear.
+      const jquery = window.django && window.django.jQuery;
+      if (jquery) jquery(sourceSelect).on('change', loadTemplate);
+    }
+    // Belt and braces: every change already mirrors, but a gesture still in flight
+    // when the form is submitted has not fired its committed change yet.
+    const form = field.closest('form');
+    if (form) form.addEventListener('submit', mirror);
+  }
+
+  // -- live mode: the graph has an endpoint of its own -----------------------
+
+  if (url('machineUrl')) {
+    getJson(url('machineUrl'))
+      .then((machine) => {
+        editor.value = machine;
+        editor.zoomToFit();
+        // Keep what the page came with — the read-only note — and what the
+        // assignment itself had to say: a graph stored without coordinates is laid
+        // out on the way in, and that layout is real work waiting to be saved.
+        if (!readOnly && !dirty) say('');
+      })
+      .catch((error) => say(`Could not load the graph: ${error.message}`, 'error'));
+  }
 
   editor.addEventListener('state-machine-change', (event) => {
     // Mid-drag frames are not worth marking the form dirty over.
     if (event.detail.transient) return;
+    mirror();
+    // A read-only canvas still lays an unpositioned graph out, and there is nothing
+    // to do about that here: no button to save it with and nothing to warn about.
+    if (readOnly) return;
     dirty = true;
-    say('Unsaved changes.', 'dirty');
+    if (!field) say('Unsaved changes.', 'dirty');
   });
 
   if (saveButton) {
@@ -85,7 +185,8 @@ if (container) {
   }
 
   window.addEventListener('beforeunload', (event) => {
-    if (!dirty) return;
+    // In form mode the graph goes with the form, so its own Save is what settles it.
+    if (!dirty || field) return;
     event.preventDefault();
     event.returnValue = '';
   });

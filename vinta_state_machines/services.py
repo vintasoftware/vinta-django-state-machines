@@ -284,6 +284,8 @@ def clone_version(
             requires_approval=edge.requires_approval,
             order=edge.order,
             description=edge.description,
+            label_offset_x=edge.label_offset_x,
+            label_offset_y=edge.label_offset_y,
         )
     for hook in version.hooks.all():
         StateMachineHook.objects.create(

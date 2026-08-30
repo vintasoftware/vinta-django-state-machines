@@ -1,0 +1,42 @@
+{% load i18n %}
+{% comment %}
+The canvas fieldset, shared by the two change forms that carry one.
+
+Two modes, told apart by which data attributes are set:
+
+* ``machine-url`` — a saved version. The graph is loaded and saved on its own
+  endpoint, from the "Save graph" button beside it.
+* ``field`` — an add form. There is no row yet, so the document rides along in the
+  hidden field of that name and is applied once the row has been created; the form's
+  own Save is what stores it, and there is no button of ours.
+{% endcomment %}
+<fieldset class="module aligned">
+  <h2>{% translate "Graph" %}</h2>
+  {% if dsm_editor.field %}{{ adminform.form.graph.errors }}{% endif %}
+  <div class="dsm-editor"
+       id="dsm-editor"
+       data-side-effects-url="{{ dsm_editor.side_effects_url }}"
+       data-actions-url="{{ dsm_editor.actions_url }}"
+       data-guard-url="{{ dsm_editor.guard_url }}"
+       {% if dsm_editor.machine_url %}data-machine-url="{{ dsm_editor.machine_url }}"{% endif %}
+       {% if dsm_editor.template_url %}data-template-url="{{ dsm_editor.template_url }}"{% endif %}
+       {% if dsm_editor.source_field %}data-source-field="{{ dsm_editor.source_field }}"{% endif %}
+       {% if dsm_editor.field %}data-field="{{ dsm_editor.field }}"{% endif %}
+       data-readonly="{% if dsm_editor.read_only %}1{% else %}0{% endif %}">
+    {% if dsm_editor.seed is not None %}{{ dsm_editor.seed|json_script:"dsm-editor-seed" }}{% endif %}
+    {% if dsm_editor.field %}{{ adminform.form.graph }}{% endif %}
+    <div class="dsm-editor__bar">
+      {% if dsm_editor.machine_url and not dsm_editor.read_only %}
+        <button type="button" class="default" data-dsm-save>{% translate "Save graph" %}</button>
+      {% endif %}
+      <span class="dsm-editor__status" data-dsm-status>
+        {% if dsm_editor.read_only %}
+          {% translate "This version is no longer a draft, so its graph is read only." %}
+        {% elif dsm_editor.field %}
+          {% translate "Draw the graph here; it is saved with the rest of the form." %}
+        {% endif %}
+      </span>
+    </div>
+    <state-machine-editor></state-machine-editor>
+  </div>
+</fieldset>
