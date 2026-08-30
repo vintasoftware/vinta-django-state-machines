@@ -6,6 +6,73 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-30
+
+### Added
+
+- **A machine and its first version are one form.** *Add state machine* now asks for the
+  machine's fields, the label of its first version and the graph together; one save creates
+  the machine, files the version as a draft and applies what was drawn on the canvas. A
+  machine on its own governs nothing — every state and transition lives on a version — so
+  creating one without one was a row somebody had to come back to.
+
+  The scope select may be left empty there and means the **global** machine, the fallback
+  every tenant without one of its own uses, whose row is created on demand. A project that
+  has never created a scope can now author its first machine without visiting another form
+  first.
+
+- **A new version starts from the previous one.** *Add state machine version* carries the
+  same canvas, seeded with the machine's newest version that has anything on it — a draft
+  filed and never drawn is not what anybody means by *the previous setup*. Picking a
+  different machine reloads the canvas from that machine instead, and a graph stamped for one
+  machine filed under another is refused rather than landing under the wrong key.
+
+  `lifecycle` is no longer offered when adding: a version being drawn is a draft by
+  definition, and a published one would refuse the very graph the form exists to apply.
+  Publishing stays the changelist action it was.
+
+  On both add forms the graph travels **with the form** — there is no row yet to hang an
+  endpoint off — so there is no *Save graph* button and the form's own Save stores it. A
+  refused document comes back on the form, reason above the canvas and graph still on it,
+  rather than after the row has been created.
+
+- `check_editor_machine(document)`: every reason `apply_editor_machine` would refuse a
+  document, read off the document alone. The rules it cannot check are all about rows that
+  are already there, and a version that has just been created has none — so for a new version
+  it is the whole list, which is what lets the add forms validate before saving.
+- `editor_machine_template(machine)` and `empty_editor_machine(machine=None)`: the document a
+  new version starts from, and one with nothing on it. Row ids are blanked in the template,
+  since a transition's id is the primary key of a row belonging to the version it came from.
+
+### Changed
+
+- The bundled `vinta-state-machine-editor` moves from 0.4.0 to **0.5.0**, which brings
+  automatic layout. A graph that never came from the canvas — seeded by `define_machine`,
+  imported, or written in a data migration — has no coordinates, so every card used to land
+  on top of the others at `(0, 0)`. The editor now organizes such a graph before drawing it:
+  columns left to right, one per step away from where a record enters the machine, with the
+  states in a column ordered so the edges between them cross as little as possible. The new
+  **Organize** button does the same on demand. On a draft the layout is offered as unsaved
+  work, so *Save graph* stores the positions on the states.
+- The canvas's catalog endpoints — the side effects, the actions and the guard checker — moved
+  out from under a version's URL, since none of them depends on one and an add form has no
+  version to hang them off. They are now `…/statemachineversion/editor/side-effects/`,
+  `…/editor/actions/` and `…/editor/guard/`, served under both admins, and the permission
+  they check is view permission on the model rather than on one row. The document endpoint
+  is unchanged, at `…/<id>/editor/machine/`.
+- The change form template's canvas markup moved into two includes,
+  `admin/state_machines/_canvas.html` and `admin/state_machines/_canvas_head.html`, so both
+  admins render the same thing. A project overriding
+  `admin/state_machines/statemachineversion/change_form.html` still overrides it.
+
+### Fixed
+
+- The canvas no longer wipes the *this version is read only* note off the status line the
+  moment the graph finishes loading.
+- `clone_version` now carries a transition card's `label_offset_x` / `label_offset_y` across.
+  A cloned version had every card back on its edge, so the canvas of version *n+1* did not
+  look like the one it was cloned from.
+
 ## [0.2.0] - 2026-08-28
 
 ### Changed
@@ -144,6 +211,7 @@ package; if this is your first install, only **Added** applies.
   leaving the same state, so the two sort identically; `define_machine` still numbers
   across the version.
 
-[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/vintasoftware/vinta-django-state-machines/releases/tag/v0.1.0

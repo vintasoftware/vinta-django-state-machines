@@ -17,11 +17,19 @@ from vinta_state_machines.editor import (
     action_catalog,
     apply_editor_machine,
     check_guard,
+    editor_machine_template,
+    empty_editor_machine,
     side_effect_definitions,
     to_editor_machine,
 )
 from vinta_state_machines.enums import Lifecycle
 from vinta_state_machines.exceptions import StateMachineError
+from vinta_state_machines.forms import (
+    GRAPH_FIELD,
+    StateMachineVersionAddForm,
+    StateMachineWithVersionForm,
+)
+from vinta_state_machines.identities import resolve_identity
 from vinta_state_machines.models import (
     ActionType,
     StateMachine,
@@ -107,8 +115,82 @@ class HookInline(admin.TabularInline):
     )
 
 
+class EditorCanvasMixin(admin.ModelAdmin):
+    """Shared plumbing for the two admins that put a canvas on their change form.
+
+    The catalogs and the guard checker belong to no particular row: they answer the
+    same whichever graph is being drawn, and an **add** form has no row to hang them
+    off at all.  So they sit beside the changelist rather than under an object's URL,
+    and both admins serve their own copy under their own model.
+    """
+
+    def get_urls(self) -> list[Any]:
+        prefix = f"{self.opts.app_label}_{self.opts.model_name}_editor"
+        mine: list[Any] = [
+            path(
+                "editor/side-effects/",
+                self.admin_site.admin_view(self.editor_side_effects_view),
+                name=f"{prefix}_side_effects",
+            ),
+            path(
+                "editor/actions/",
+                self.admin_site.admin_view(self.editor_actions_view),
+                name=f"{prefix}_actions",
+            ),
+            path(
+                "editor/guard/",
+                self.admin_site.admin_view(self.editor_guard_view),
+                name=f"{prefix}_guard",
+            ),
+        ]
+        return mine + list(super().get_urls())
+
+    def editor_url(self, suffix: str, *args: Any) -> str:
+        prefix = f"admin:{self.opts.app_label}_{self.opts.model_name}_editor"
+        return reverse(f"{prefix}_{suffix}", args=args, current_app=self.admin_site.name)
+
+    def editor_side_effects_view(self, request: HttpRequest) -> HttpResponse:
+        if not self.has_view_permission(request):
+            raise Http404
+        return JsonResponse(side_effect_definitions(), safe=False)
+
+    def editor_actions_view(self, request: HttpRequest) -> HttpResponse:
+        if not self.has_view_permission(request):
+            raise Http404
+        return JsonResponse(action_catalog(), safe=False)
+
+    def editor_guard_view(self, request: HttpRequest) -> HttpResponse:
+        if not self.has_view_permission(request):
+            raise Http404
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["POST"])
+        try:
+            payload = json.loads(request.body or b"{}")
+        except json.JSONDecodeError:
+            return JsonResponse({"ok": False, "errors": ["Malformed JSON."]})
+        return JsonResponse(check_guard(str(payload.get("expression") or "")))
+
+    def canvas_context(self, **extra: Any) -> dict[str, Any]:
+        """What the canvas partial reads, with the endpoints every mode needs."""
+        context: dict[str, Any] = {
+            "side_effects_url": self.editor_url("side_effects"),
+            "actions_url": self.editor_url("actions"),
+            "guard_url": self.editor_url("guard"),
+            # Live mode: the graph is loaded and saved on its own endpoint, beside
+            # the fields. Form mode: it rides along in ``field`` and is applied when
+            # the row it belongs to has been created.
+            "machine_url": None,
+            "template_url": None,
+            "field": None,
+            "seed": None,
+            "read_only": False,
+        }
+        context.update(extra)
+        return context
+
+
 @admin.register(StateMachineVersion)
-class StateMachineVersionAdmin(admin.ModelAdmin):
+class StateMachineVersionAdmin(EditorCanvasMixin):
     list_display = ("__str__", "lifecycle", "state_count", "transition_count", "published_at")
     list_filter = ("lifecycle", "state_machine")
     search_fields = ("version", "state_machine__key", "notes")
@@ -138,37 +220,21 @@ class StateMachineVersionAdmin(admin.ModelAdmin):
     def transition_count(self, obj: StateMachineVersion) -> int:
         return getattr(obj, "_transitions", 0)
 
-    def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> tuple[str, ...]:
-        """A published version is immutable; only a draft can still be edited."""
-        if obj is not None and obj.lifecycle != Lifecycle.DRAFT:
-            return tuple(field.name for field in self.model._meta.fields)
-        return self.readonly_fields
-
     # -------------------------------------------------------------------- canvas
 
     def get_urls(self) -> list[Any]:
-        """The endpoints the canvas talks to, under this version's own URL."""
+        """The two endpoints that do belong to a row, on top of the shared ones."""
         prefix = f"{self.opts.app_label}_{self.opts.model_name}_editor"
         mine = [
+            path(
+                "editor/template/",
+                self.admin_site.admin_view(self.editor_template_view),
+                name=f"{prefix}_template",
+            ),
             path(
                 "<path:object_id>/editor/machine/",
                 self.admin_site.admin_view(self.editor_machine_view),
                 name=f"{prefix}_machine",
-            ),
-            path(
-                "<path:object_id>/editor/side-effects/",
-                self.admin_site.admin_view(self.editor_side_effects_view),
-                name=f"{prefix}_side_effects",
-            ),
-            path(
-                "<path:object_id>/editor/actions/",
-                self.admin_site.admin_view(self.editor_actions_view),
-                name=f"{prefix}_actions",
-            ),
-            path(
-                "<path:object_id>/editor/guard/",
-                self.admin_site.admin_view(self.editor_guard_view),
-                name=f"{prefix}_guard",
             ),
         ]
         return mine + super().get_urls()
@@ -200,23 +266,58 @@ class StateMachineVersionAdmin(admin.ModelAdmin):
         # a state drawn on the canvas only learns its vocabulary key here.
         return JsonResponse(to_editor_machine(version))
 
-    def editor_side_effects_view(self, request: HttpRequest, object_id: str) -> HttpResponse:
-        self._editor_object(request, object_id)
-        return JsonResponse(side_effect_definitions(), safe=False)
+    def editor_template_view(self, request: HttpRequest) -> HttpResponse:
+        """The document a new version of ``?state_machine=<pk>`` starts from.
 
-    def editor_actions_view(self, request: HttpRequest, object_id: str) -> HttpResponse:
-        self._editor_object(request, object_id)
-        return JsonResponse(action_catalog(), safe=False)
+        What the add form seeds its canvas with, so authoring version *n+1* starts
+        from version *n*.  An unknown machine — or none chosen yet — answers with an
+        empty canvas rather than a 404: the select is the thing that has not been
+        filled in, and the form is still being filled in.
+        """
+        if not self.has_view_permission(request):
+            raise Http404
+        machine = None
+        raw = request.GET.get("state_machine") or ""
+        if raw.isdigit():
+            machine = StateMachine.objects.filter(pk=int(raw)).first()
+        if machine is None:
+            return JsonResponse(empty_editor_machine())
+        return JsonResponse(editor_machine_template(machine))
 
-    def editor_guard_view(self, request: HttpRequest, object_id: str) -> HttpResponse:
-        self._editor_object(request, object_id)
-        if request.method != "POST":
-            return HttpResponseNotAllowed(["POST"])
-        try:
-            payload = json.loads(request.body or b"{}")
-        except json.JSONDecodeError:
-            return JsonResponse({"ok": False, "errors": ["Malformed JSON."]})
-        return JsonResponse(check_guard(str(payload.get("expression") or "")))
+    # ------------------------------------------------------------- the add form
+
+    def get_form(
+        self, request: HttpRequest, obj: Any = None, change: bool = False, **kwargs: Any
+    ) -> Any:
+        """A version being added is drawn, not typed: it carries a graph."""
+        if obj is None:
+            kwargs["form"] = StateMachineVersionAddForm
+        return super().get_form(request, obj, change=change, **kwargs)
+
+    def get_fields(self, request: HttpRequest, obj: Any = None) -> list[Any]:
+        # The hidden graph field is rendered by the canvas partial, beside the canvas
+        # that fills it in, so that its errors land where the graph is.
+        return [name for name in super().get_fields(request, obj) if name != GRAPH_FIELD]
+
+    def get_readonly_fields(self, request: HttpRequest, obj: Any = None) -> tuple[str, ...]:
+        """A published version is immutable; only a draft can still be edited."""
+        if obj is None:
+            return ()
+        if obj.lifecycle != Lifecycle.DRAFT:
+            return tuple(field.name for field in self.model._meta.fields)
+        return self.readonly_fields
+
+    def get_inlines(self, request: HttpRequest, obj: Any = None) -> list[Any]:
+        """Nothing to bind rows to until the version exists, and the canvas draws them."""
+        return [] if obj is None else list(super().get_inlines(request, obj))
+
+    def save_model(self, request: HttpRequest, obj: Any, form: Any, change: bool) -> None:
+        super().save_model(request, obj, form, change)
+        graph = form.cleaned_data.get(GRAPH_FIELD) if not change else None
+        if graph:
+            # Refused documents were caught by the form, which is the last moment
+            # anybody could still have fixed one.
+            apply_editor_machine(obj, graph)
 
     def render_change_form(
         self,
@@ -227,26 +328,23 @@ class StateMachineVersionAdmin(admin.ModelAdmin):
         form_url: str = "",
         obj: Any = None,
     ) -> HttpResponse:
-        """Hand the template the canvas endpoints, but only for a version that exists."""
+        """Hand the template the canvas: live for a saved version, seeded for a new one."""
         version = obj
         if version is not None and version.pk:
-            prefix = f"admin:{self.opts.app_label}_{self.opts.model_name}_editor"
-
-            def endpoint(suffix: str) -> str:
-                return reverse(
-                    f"{prefix}_{suffix}",
-                    args=[version.pk],
-                    current_app=self.admin_site.name,
-                )
-
-            context["dsm_editor"] = {
-                "machine_url": endpoint("machine"),
-                "side_effects_url": endpoint("side_effects"),
-                "actions_url": endpoint("actions"),
-                "guard_url": endpoint("guard"),
-                "read_only": not version.is_editable
+            context["dsm_editor"] = self.canvas_context(
+                machine_url=self.editor_url("machine", version.pk),
+                read_only=not version.is_editable
                 or not self.has_change_permission(request, version),
-            }
+            )
+        elif add:
+            context["dsm_editor"] = self.canvas_context(
+                template_url=self.editor_url("template"),
+                field=GRAPH_FIELD,
+                # Which select to follow: picking the machine picks the version the
+                # canvas starts from.
+                source_field="id_state_machine",
+                seed=empty_editor_machine(),
+            )
         response: HttpResponse = super().render_change_form(
             request, context, add=add, change=change, form_url=form_url, obj=obj
         )
@@ -331,12 +429,71 @@ if StateMachineIdentity._meta.swapped is None:
 
 
 @admin.register(StateMachine)
-class StateMachineAdmin(admin.ModelAdmin):
+class StateMachineAdmin(EditorCanvasMixin):
+    """A machine and, when it is being created, the first version of its graph.
+
+    A machine on its own governs nothing — every state and transition lives on a
+    version — so adding one asks for its first version's label and puts the canvas on
+    the same form.  One save creates the machine, files the version as a draft and
+    applies the graph that was drawn for it.
+    """
+
     list_display = ("key", "scope", "entity_type", "status_field", "name", "default_version")
     list_filter = ("entity_type", "scope")
     search_fields = ("key", "name", "description")
     autocomplete_fields = ("default_version",)
     inlines = (VersionInline,)
+    change_form_template = "admin/state_machines/statemachine/change_form.html"
+
+    def get_form(
+        self, request: HttpRequest, obj: Any = None, change: bool = False, **kwargs: Any
+    ) -> Any:
+        if obj is None:
+            kwargs["form"] = StateMachineWithVersionForm
+        return super().get_form(request, obj, change=change, **kwargs)
+
+    def get_fields(self, request: HttpRequest, obj: Any = None) -> list[Any]:
+        # Rendered by the canvas partial instead, so its errors land on the graph.
+        return [name for name in super().get_fields(request, obj) if name != GRAPH_FIELD]
+
+    def get_inlines(self, request: HttpRequest, obj: Any = None) -> list[Any]:
+        """The first version is a field on this form, not a row to add beside it."""
+        return [] if obj is None else list(super().get_inlines(request, obj))
+
+    def save_model(self, request: HttpRequest, obj: Any, form: Any, change: bool) -> None:
+        if not change and obj.author_id is None:
+            obj.author = resolve_identity(request.user)
+        super().save_model(request, obj, form, change)
+        if change:
+            return
+        version = StateMachineVersion.objects.create(
+            state_machine=obj,
+            version=form.cleaned_data["version"],
+            notes=form.cleaned_data.get("notes") or "",
+        )
+        graph = form.cleaned_data.get(GRAPH_FIELD)
+        if graph:
+            apply_editor_machine(version, graph)
+
+    def render_change_form(
+        self,
+        request: HttpRequest,
+        context: dict[str, Any],
+        add: bool = False,
+        change: bool = False,
+        form_url: str = "",
+        obj: Any = None,
+    ) -> HttpResponse:
+        """The canvas, but only while adding: an existing machine has versions of its own."""
+        if add and obj is None:
+            context["dsm_editor"] = self.canvas_context(
+                field=GRAPH_FIELD,
+                seed=empty_editor_machine(),
+            )
+        response: HttpResponse = super().render_change_form(
+            request, context, add=add, change=change, form_url=form_url, obj=obj
+        )
+        return response
 
 
 @admin.register(StatusTransition)
