@@ -83,12 +83,18 @@ def test_the_add_form_carries_a_canvas_and_the_first_version_label(as_staff):
     assert '<script type="module" src="/static/vinta_state_machines/admin-editor.js">' in body
 
 
-def test_an_existing_machine_keeps_its_plain_change_form(as_staff, risk_machine):
+def test_an_existing_machine_gets_the_live_canvas_not_the_add_form_one(as_staff, risk_machine):
+    """Adding draws into the form; changing talks to an endpoint and publishes."""
     url = reverse("admin:state_machines_statemachine_change", args=[risk_machine.pk])
     body = as_staff.get(url).content.decode()
 
-    # Its graphs live on its versions, each with a canvas of its own.
-    assert "<state-machine-editor>" not in body
+    assert "<state-machine-editor>" in body
+    assert "data-machine-url=" in body
+    assert "Save and publish a new version" in body
+    # The first version's fields belong to the add form alone: this machine has
+    # versions of its own, and the graph is saved on its endpoint rather than here.
+    assert 'name="graph"' not in body
+    assert 'name="version"' not in body
 
 
 def test_saving_creates_the_machine_its_first_version_and_the_graph(as_staff):

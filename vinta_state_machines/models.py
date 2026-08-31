@@ -492,6 +492,23 @@ class StateMachine(TimeStampedModel):
     def __str__(self) -> str:
         return self.key
 
+    def latest_version(self) -> StateMachineVersion | None:
+        """The most recently created version, whatever its lifecycle.
+
+        What the canvas on this machine's change form opens on, and what the label of
+        the next version is bumped from.  Deliberately not ``default_version``: an
+        in-flight draft is the newest picture of the flow even though nothing pins it
+        yet.  Deliberately not
+        :func:`~vinta_state_machines.editor.editor_machine_template`'s "newest version
+        with anything on it" either -- that one is seeding a canvas and an empty draft
+        would defeat it, while this one has to agree with the label the next version
+        gets and with the stamp that catches a stale canvas.
+
+        Returns:
+            The version, or ``None`` for a machine that has none yet.
+        """
+        return self.versions.order_by("-created_at", "-pk").first()
+
     def statuses(self) -> models.QuerySet[StatusDefinition]:
         """The vocabulary this machine draws its states from."""
         return StatusDefinition.objects.filter(

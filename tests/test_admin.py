@@ -84,6 +84,55 @@ def test_the_publish_action_surfaces_warnings_it_did_not_block_on(
     assert any("not marked terminal" in message for message in warnings)
 
 
+# ------------------------------------------------------------------------ clone
+
+
+def test_the_clone_action_copies_a_version_into_a_new_draft(
+    version_admin, request_with_messages, risk_version
+):
+    version_admin.clone(request_with_messages, StateMachineVersion.objects.all())
+
+    draft = StateMachineVersion.objects.get(version="2")
+    assert draft.lifecycle == Lifecycle.DRAFT
+    assert draft.state_machine_id == risk_version.state_machine_id
+    assert draft.states.count() == risk_version.states.count()
+    assert draft.transitions.count() == risk_version.transitions.count()
+    assert "Cloned from 1." in draft.notes
+    assert "1 draft created: risk.status@2." in messages_of(request_with_messages)
+
+
+def test_the_clone_action_leaves_the_version_it_copied_alone(
+    version_admin, request_with_messages, risk_version, risk_machine
+):
+    version_admin.clone(request_with_messages, StateMachineVersion.objects.all())
+
+    risk_version.refresh_from_db()
+    risk_machine.refresh_from_db()
+    assert risk_version.lifecycle == Lifecycle.PUBLISHED
+    # A draft is not what new records pin, so the default must not have moved.
+    assert risk_machine.default_version_id == risk_version.pk
+
+
+def test_cloning_twice_does_not_collide_on_the_label(
+    version_admin, request_with_messages, risk_version
+):
+    published = StateMachineVersion.objects.filter(pk=risk_version.pk)
+    version_admin.clone(request_with_messages, published)
+    version_admin.clone(request_with_messages, published)
+
+    assert set(StateMachineVersion.objects.values_list("version", flat=True)) == {"1", "2", "3"}
+
+
+def test_the_clone_action_records_who_made_the_draft(
+    version_admin, request_with_messages, risk_version
+):
+    version_admin.clone(request_with_messages, StateMachineVersion.objects.all())
+
+    draft = StateMachineVersion.objects.get(version="2")
+    assert draft.author is not None
+    assert draft.author.user_id == request_with_messages.user.pk
+
+
 # --------------------------------------------------------------------- validate
 
 

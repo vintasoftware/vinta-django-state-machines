@@ -10,7 +10,7 @@ from django.contrib.admin.utils import unquote
 from django.db.models import Count, QuerySet
 from django.http import Http404, HttpResponse, HttpResponseNotAllowed, JsonResponse
 from django.urls import path, reverse
-from django.utils.translation import gettext_lazy as _, ngettext
+from django.utils.translation import gettext, gettext_lazy as _, ngettext
 
 from vinta_state_machines.editor import (
     EditorPayloadError,
@@ -19,6 +19,7 @@ from vinta_state_machines.editor import (
     check_guard,
     editor_machine_template,
     empty_editor_machine,
+    publish_editor_machine,
     side_effect_definitions,
     to_editor_machine,
 )
@@ -42,7 +43,12 @@ from vinta_state_machines.models import (
     StatusDefinition,
     StatusTransition,
 )
-from vinta_state_machines.services import publish_version, validate_version
+from vinta_state_machines.services import (
+    clone_version,
+    next_version_label,
+    publish_version,
+    validate_version,
+)
 
 if TYPE_CHECKING:
     from django.http import HttpRequest
@@ -184,6 +190,14 @@ class EditorCanvasMixin(admin.ModelAdmin):
             "field": None,
             "seed": None,
             "read_only": False,
+            # Why the canvas only draws, shown where the save button would be.
+            "read_only_message": _(
+                "This version is no longer a draft, so its graph is read only."
+            ),
+            "save_label": _("Save graph"),
+            # Whether landing the save leaves the rest of the page stale.  Publishing a
+            # new version does -- the version inline has just gained a row.
+            "reload_on_save": False,
         }
         context.update(extra)
         return context
@@ -196,7 +210,7 @@ class StateMachineVersionAdmin(EditorCanvasMixin):
     search_fields = ("version", "state_machine__key", "notes")
     autocomplete_fields = ("state_machine",)
     inlines = (StateInline, TransitionInline, HookInline)
-    actions = ("publish", "validate")
+    actions = ("publish", "validate", "clone")
     readonly_fields = ("published_at",)
     change_form_template = "admin/state_machines/statemachineversion/change_form.html"
 
@@ -369,6 +383,39 @@ class StateMachineVersionAdmin(EditorCanvasMixin):
                 level=messages.SUCCESS,
             )
 
+    @admin.action(description=_("Clone selected versions as new drafts"))
+    def clone(self, request: HttpRequest, queryset: QuerySet[StateMachineVersion]) -> None:
+        """Deep copy each selection into a fresh draft, ready to be edited and published.
+
+        The copy is what authoring version *n+1* starts from when it is done one step at
+        a time -- the machine's own canvas is the one-gesture version of the same move --
+        so its label is the selection's own with its trailing number bumped, and nothing
+        about the version it came from changes, least of all its lifecycle.
+        """
+        drafts = [
+            clone_version(
+                version,
+                next_version_label(version.state_machine, after=version.version),
+                author=request.user,
+                notes=gettext("Cloned from %(version)s.") % {"version": version.version},
+            )
+            for version in queryset.select_related("state_machine")
+        ]
+        if drafts:
+            self.message_user(
+                request,
+                ngettext(
+                    "%(count)d draft created: %(labels)s.",
+                    "%(count)d drafts created: %(labels)s.",
+                    len(drafts),
+                )
+                % {
+                    "count": len(drafts),
+                    "labels": ", ".join(str(draft) for draft in drafts),
+                },
+                level=messages.SUCCESS,
+            )
+
     @admin.action(description=_("Validate selected versions"))
     def validate(self, request: HttpRequest, queryset: QuerySet[StateMachineVersion]) -> None:
         for version in queryset.select_related("state_machine"):
@@ -430,12 +477,20 @@ if StateMachineIdentity._meta.swapped is None:
 
 @admin.register(StateMachine)
 class StateMachineAdmin(EditorCanvasMixin):
-    """A machine and, when it is being created, the first version of its graph.
+    """A machine and its graph, on one form, at both ends of its life.
 
     A machine on its own governs nothing — every state and transition lives on a
-    version — so adding one asks for its first version's label and puts the canvas on
-    the same form.  One save creates the machine, files the version as a draft and
+    version — so **adding** one asks for its first version's label and puts the canvas
+    on the same form.  One save creates the machine, files the version as a draft and
     applies the graph that was drawn for it.
+
+    **Changing** one carries the same canvas, opened on the machine's
+    :meth:`~vinta_state_machines.models.StateMachine.latest_version`, and each save
+    publishes a *new* version and makes it the default.  Nothing already published is
+    touched: records that pinned the old graph go on validating against it.  That is
+    the whole difference between this canvas and the one on a version's own form, which
+    edits that one draft in place — here versioning is a consequence of editing rather
+    than one more thing to remember.
     """
 
     list_display = ("key", "scope", "entity_type", "status_field", "name", "default_version")
@@ -475,6 +530,54 @@ class StateMachineAdmin(EditorCanvasMixin):
         if graph:
             apply_editor_machine(version, graph)
 
+    # -------------------------------------------------------------------- canvas
+
+    def get_urls(self) -> list[Any]:
+        """The document endpoint for a saved machine, on top of the shared catalogs."""
+        prefix = f"{self.opts.app_label}_{self.opts.model_name}_editor"
+        mine = [
+            path(
+                "<path:object_id>/editor/machine/",
+                self.admin_site.admin_view(self.editor_machine_view),
+                name=f"{prefix}_machine",
+            ),
+        ]
+        return mine + super().get_urls()
+
+    def editor_machine_view(self, request: HttpRequest, object_id: str) -> HttpResponse:
+        """GET the machine's latest graph, POST one back to publish it as a new version."""
+        machine: StateMachine | None = self.get_object(request, unquote(object_id))
+        if machine is None or not self.has_view_permission(request, machine):
+            raise Http404
+        if request.method == "GET":
+            latest = machine.latest_version()
+            document = (
+                to_editor_machine(latest) if latest is not None else empty_editor_machine(machine)
+            )
+            return JsonResponse(document)
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["GET", "POST"])
+        if not self.has_change_permission(request, machine):
+            raise Http404
+        try:
+            payload = json.loads(request.body or b"{}")
+        except json.JSONDecodeError as exc:
+            return JsonResponse({"errors": [f"Malformed JSON: {exc}"]}, status=400)
+        try:
+            version, report = publish_editor_machine(machine, payload, author=request.user)
+        except EditorPayloadError as exc:
+            return JsonResponse({"errors": exc.errors}, status=400)
+        # Messages rather than a field on the response: the page reloads once this
+        # lands, because the version inline below the canvas has just gained a row.
+        self.message_user(
+            request,
+            gettext("Published %(version)s.") % {"version": version},
+            level=messages.SUCCESS,
+        )
+        for warning in report.warnings:
+            self.message_user(request, f"{version}: {warning}", level=messages.WARNING)
+        return JsonResponse(to_editor_machine(version))
+
     def render_change_form(
         self,
         request: HttpRequest,
@@ -484,11 +587,20 @@ class StateMachineAdmin(EditorCanvasMixin):
         form_url: str = "",
         obj: Any = None,
     ) -> HttpResponse:
-        """The canvas, but only while adding: an existing machine has versions of its own."""
+        """The canvas both ways: drawn into the form while adding, live once saved."""
         if add and obj is None:
             context["dsm_editor"] = self.canvas_context(
                 field=GRAPH_FIELD,
                 seed=empty_editor_machine(),
+            )
+        elif obj is not None and obj.pk:
+            read_only = not self.has_change_permission(request, obj)
+            context["dsm_editor"] = self.canvas_context(
+                machine_url=self.editor_url("machine", obj.pk),
+                read_only=read_only,
+                read_only_message=_("You do not have permission to change this graph."),
+                save_label=_("Save and publish a new version"),
+                reload_on_save=True,
             )
         response: HttpResponse = super().render_change_form(
             request, context, add=add, change=change, form_url=form_url, obj=obj

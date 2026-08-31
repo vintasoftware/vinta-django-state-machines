@@ -34,7 +34,7 @@ from django.db import transaction
 from django.db.models import Count, ProtectedError
 from django.utils.text import slugify
 
-from vinta_state_machines.enums import HookEvent, HookTiming, StateColor
+from vinta_state_machines.enums import HookEvent, HookTiming, Lifecycle, StateColor
 from vinta_state_machines.exceptions import StateMachineError
 from vinta_state_machines.graph import invalidate_graph
 from vinta_state_machines.guards import GuardSyntaxError, validate_guard
@@ -49,6 +49,12 @@ from vinta_state_machines.models import (
     StatusDefinition,
 )
 from vinta_state_machines.registry import NotRegistered
+from vinta_state_machines.services import (
+    ValidationReport,
+    next_version_label,
+    publish_version,
+    validate_version,
+)
 from vinta_state_machines.side_effects import side_effect_catalog
 
 if TYPE_CHECKING:
@@ -62,6 +68,7 @@ __all__ = [
     "check_guard",
     "editor_machine_template",
     "empty_editor_machine",
+    "publish_editor_machine",
     "side_effect_definitions",
     "to_editor_machine",
 ]
@@ -665,3 +672,114 @@ def _as_int(value: Any) -> int:
         return round(float(value))
     except (TypeError, ValueError):
         return 0
+
+
+# ---------------------------------------------------------------- publishing a revision
+
+
+def _check_document_is_current(payload: Any, source: StateMachineVersion | None) -> None:
+    """Refuse a canvas drawn on a version that is no longer the machine's latest.
+
+    The document carries the label it was serialized from, so a graph edited in one tab
+    while another published a version is caught here instead of silently landing on top
+    of work it never saw.  A document with no stamp at all -- an empty canvas, which is
+    what a machine with no versions starts from -- has nothing to be stale about.
+    """
+    stamp = payload.get("data") if isinstance(payload, dict) else None
+    posted = stamp.get("version") if isinstance(stamp, dict) else None
+    current = source.version if source is not None else None
+    if posted is not None and posted != current:
+        machine_key = source.state_machine.key if source is not None else "?"
+        raise EditorPayloadError(
+            [
+                f"This canvas was loaded from version {posted!r}, but the latest version "
+                f"of {machine_key} is now {current!r}. Reload before saving: publishing "
+                "this would drop whatever was published in between."
+            ]
+        )
+
+
+def _carry_over_offscreen_hooks(source: StateMachineVersion, draft: StateMachineVersion) -> None:
+    """Copy the hooks the canvas cannot draw from one version to the next.
+
+    The document is the whole truth about everything the editor puts on screen, so the
+    draft is built from it rather than copied -- which is what keeps a transition from
+    colliding with the copy of itself on the way in.  ``any_transition`` hooks belong to
+    the version rather than to any one card, so they are never in the document and would
+    otherwise be lost at each save.
+    """
+    for hook in source.hooks.filter(event=HookEvent.ANY_TRANSITION):
+        StateMachineHook.objects.create(
+            state_machine_version=draft,
+            handler_key=hook.handler_key,
+            timing=hook.timing,
+            event=hook.event,
+            params=dict(hook.params or {}),
+            order=hook.order,
+            is_active=hook.is_active,
+            on_commit=hook.on_commit,
+            description=hook.description,
+        )
+
+
+@transaction.atomic
+def publish_editor_machine(
+    machine: StateMachine,
+    payload: Any,
+    *,
+    author: Any = None,
+    label: str | None = None,
+    notes: str = "",
+) -> tuple[StateMachineVersion, ValidationReport]:
+    """Publish a canvas document as the machine's next version.
+
+    This is the save path behind the canvas on a *machine's* change form, where a graph
+    is edited as one living thing rather than one version at a time.  Nothing existing
+    is mutated: the document lands on a brand new draft, which is then published and
+    made the default -- so records that pinned the old version go on validating against
+    exactly the graph they pinned.
+
+    Where the version add form asks for a label and files a draft, this asks for
+    neither: it is the same move made in one gesture, for people who think in flows
+    rather than in version rows.
+
+    The draft is built from the document rather than cloned from the version it was
+    drawn on, because the two describe the same graph and the rows would collide.  What
+    the canvas cannot draw is carried across separately; see
+    :func:`_carry_over_offscreen_hooks`.
+
+    Args:
+        machine: The machine to publish a new version of.
+        payload: The document the canvas posted back.
+        author: The principal to record as the publisher, snapshotted at this moment.
+        label: The new version's label.  Defaults to bumping the latest one.
+        notes: Notes for the new version.
+
+    Returns:
+        The published version and its validation report, whose warnings did not block.
+
+    Raises:
+        EditorPayloadError: The document is stale, cannot be reconciled, or describes a
+            graph that is not publishable.  Nothing is written in any of those cases.
+    """
+    source = machine.latest_version()
+    _check_document_is_current(payload, source)
+
+    draft = StateMachineVersion.objects.create(
+        state_machine=machine,
+        version=label or next_version_label(machine),
+        lifecycle=Lifecycle.DRAFT,
+        notes=notes,
+    )
+    if source is not None:
+        _carry_over_offscreen_hooks(source, draft)
+
+    apply_editor_machine(draft, payload)
+
+    # Validated here rather than left to ``publish_version`` so a graph the canvas drew
+    # badly comes back in the same shape as every other editor complaint.
+    report = validate_version(draft)
+    if report.errors:
+        raise EditorPayloadError(report.errors)
+    publish_version(draft, author=author, validate=False)
+    return draft, report

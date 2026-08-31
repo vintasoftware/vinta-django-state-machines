@@ -6,6 +6,42 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Editing a machine publishes a new version.** A `StateMachine`'s change form now carries
+  the canvas too, opened on the machine's latest version whatever its lifecycle. *Save and
+  publish a new version* writes a fresh version, validates it, publishes it and makes it the
+  default, in one transaction — nothing already published is touched, so records that pinned
+  the old graph go on validating against it. Where 0.3.0 put the canvas on the two **add**
+  forms, this is the same move for a machine that already exists: versioning as a
+  consequence of editing rather than one more thing to remember.
+
+  The document remembers which version it was serialized from, so a canvas left open in one
+  tab while another published is refused rather than landing on top of work it never saw. A
+  graph that would not pass `validate_version` is refused whole, with every reason at once
+  and no draft left behind.
+- `publish_editor_machine(machine, document)` behind it, returning the published version and
+  the warnings that did not block it. The new version is built from the document rather than
+  cloned from the one it was drawn on — the two describe the same graph, and the rows would
+  collide on a transition's name. `any_transition` hooks cannot be drawn, so they are carried
+  across each revision explicitly.
+- **Clone selected versions as new drafts**, an admin action on the version changelist, for
+  the finer-grained path: it deep copies a version's states, transitions, hooks and layout
+  into a new draft and leaves the version it copied alone.
+- `next_version_label(machine)`, which both of the above take their label from: it bumps the
+  trailing number — `"1"` to `"2"`, `"2024.1"` to `"2024.2"`, `"v3"` to `"v4"` — and skips
+  anything already taken.
+- `StateMachine.latest_version()`, the most recently created version whatever its lifecycle.
+  Deliberately not `editor_machine_template`'s "newest version with anything on it": that one
+  seeds a canvas, while this has to agree with the label the next version gets and with the
+  stamp that catches a stale canvas.
+
+### Changed
+
+- The canvas partial takes its save-button label, its read-only note and whether landing a
+  save reloads the page from the admin rendering it, so the two forms can say what their own
+  save actually does.
+
 ## [0.3.0] - 2026-08-30
 
 ### Added

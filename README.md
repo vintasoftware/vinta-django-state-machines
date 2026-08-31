@@ -463,9 +463,9 @@ python manage.py validate_state_machines --list-side-effects
 
 ## Editing a graph on a canvas
 
-The admin's change form for a `StateMachineVersion` embeds
+The admin embeds
 [`vinta-state-machine-editor`](https://www.npmjs.com/package/vinta-state-machine-editor), a
-web component that draws the version as a pan/zoom canvas: states as cards you can drag and
+web component that draws a graph as a pan/zoom canvas: states as cards you can drag and
 colour, transitions as edges you draw between them, and the side effects around both as
 ordered lists you fill from a dialog.
 
@@ -473,8 +473,43 @@ Nothing is needed to switch it on. The component ships pre-bundled inside this p
 there is no npm install and no build step — only `django.contrib.staticfiles` and a
 `STATIC_URL`, which any Django project already has.
 
-The canvas edits **drafts**. A published or archived version renders read only, exactly as
-its form fields do, because records pin it and its graph can no longer change.
+The same canvas sits on both change forms, and which one you want depends on whether you are
+thinking about versions at all:
+
+| | **A `StateMachine`** | **A `StateMachineVersion`** |
+| --- | --- | --- |
+| Opens on | the machine's latest version | that version |
+| Saving | publishes a **new** version and makes it the default | edits that version in place |
+| Editable when | you can change the machine | the version is still a draft |
+
+A version's canvas edits **drafts**. A published or archived version renders read only,
+exactly as its form fields do, because records pin it and its graph can no longer change.
+
+### Editing the machine, and letting the version follow
+
+Open a `StateMachine` and you get its latest graph, whatever its lifecycle. Change it, press
+**Save and publish a new version**, and that is exactly what happens: a fresh version is
+written, validated, published and made the default, in one transaction. Nothing that already
+exists is touched, so records that pinned the old graph go on validating against precisely
+the graph they pinned — versioning falls out of editing instead of being one more thing to
+remember.
+
+Three things worth knowing about that save:
+
+- The new version is **built from the document**, not copied from the one it was drawn on.
+  Hooks bound to `any_transition` are the exception: the canvas cannot draw them, so they are
+  carried across explicitly and survive every revision.
+- A graph that would not pass `validate_version` is **refused whole** — no half-published
+  version, no draft left behind — and every reason comes back at once. Warnings do not block;
+  they arrive as admin messages.
+- The document remembers which version it was serialized from, so a canvas left open in one
+  tab while another published a version is refused rather than quietly landing on top of work
+  it never saw.
+
+When you want the finer-grained path instead — revise, review, publish when ready — **Clone
+selected versions as new drafts** on the version changelist deep copies a version's states,
+transitions, hooks and layout into a new draft and leaves the version it copied entirely
+alone. Its label comes from `next_version_label`, the same bump the machine's canvas uses.
 
 ### Creating a machine and its first version together
 
@@ -572,6 +607,12 @@ apply_editor_machine(version, document)  # <- reconcile a posted one, in one tra
 the history pointing at them — survive an edit. It raises `EditorPayloadError`, which
 carries **every** problem it found rather than only the first, and rolls the whole document
 back if any of them fire.
+
+`publish_editor_machine(machine, document)` is the machine-level save behind the canvas
+above: it lands a document as the machine's next published version in one transaction, and
+returns that version together with the validation warnings that did not block it. It raises
+the same `EditorPayloadError` for a stale, unreconcilable or unpublishable document, and
+writes nothing in any of those cases.
 
 Three more, for a canvas on a form rather than on a saved row:
 

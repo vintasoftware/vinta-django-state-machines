@@ -12,6 +12,7 @@ from vinta_state_machines.services import (
     archive_version,
     clone_version,
     define_machine,
+    next_version_label,
     publish_version,
     rebase_record,
     set_default_version,
@@ -330,3 +331,47 @@ def test_a_record_created_on_a_new_version_starts_where_that_version_says(risk_v
 
     fresh = Risk.objects.create(title="Straight to assessed")
     assert fresh.status_key == "assessed"
+
+
+# ------------------------------------------------------------- next version label
+
+
+@pytest.mark.parametrize(
+    ("after", "expected"),
+    [
+        ("1", "2"),
+        ("9", "10"),
+        ("2024.1", "2024.2"),
+        ("v3", "v4"),
+        ("draft", "draft-2"),
+        ("", "-2"),
+    ],
+)
+def test_the_next_label_bumps_the_trailing_number(risk_machine, after, expected):
+    assert next_version_label(risk_machine, after=after) == expected
+
+
+def test_the_next_label_follows_the_latest_version_by_default(risk_machine, risk_version):
+    assert next_version_label(risk_machine) == "2"
+    clone_version(risk_version, "2")
+    assert next_version_label(risk_machine) == "3"
+
+
+def test_the_next_label_skips_labels_already_taken(risk_machine, risk_version):
+    """Versions are not always numbered in order, so a free label is searched for."""
+    clone_version(risk_version, "2")
+    clone_version(risk_version, "3")
+    assert next_version_label(risk_machine, after="1") == "4"
+
+
+def test_the_first_version_of_an_empty_machine_is_labelled_one(risk_machine):
+    risk_machine.default_version = None
+    risk_machine.save(update_fields=["default_version"])
+    risk_machine.versions.all().delete()
+    assert next_version_label(risk_machine) == "1"
+
+
+def test_the_latest_version_is_the_newest_whatever_its_lifecycle(risk_machine, risk_version):
+    assert risk_machine.latest_version() == risk_version
+    draft = clone_version(risk_version, "2")
+    assert risk_machine.latest_version() == draft

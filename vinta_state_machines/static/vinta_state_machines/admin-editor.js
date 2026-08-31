@@ -8,7 +8,9 @@
 // Two modes, told apart by which of those attributes are set:
 //
 // * `machine-url` — a saved version. The graph is loaded from that endpoint and
-//   posted back to it by the "Save graph" button, independently of the form.
+//   posted back to it by the save button, independently of the form. A save that
+//   publishes a new version leaves the rest of the page stale, so `reload-on-save`
+//   asks for a reload once it lands.
 // * `field` — an add form, for a row that does not exist yet. The document rides
 //   along in the hidden field of that name and the form's own Save applies it, so
 //   there is nothing of ours to press. `template-url` plus `source-field` seed the
@@ -22,6 +24,7 @@ if (container) {
   const saveButton = container.querySelector('[data-dsm-save]');
   const status = container.querySelector('[data-dsm-status]');
   const readOnly = container.dataset.readonly === '1';
+  const reloadOnSave = container.dataset.reloadOnSave === '1';
   const field = container.dataset.field
     ? document.querySelector(`[name="${container.dataset.field}"]`)
     : null;
@@ -173,8 +176,15 @@ if (container) {
         // The server is the authority on ids: a state drawn here arrives with a
         // generated one and comes back keyed by the vocabulary key it was given.
         const saved = await postJson(url('machineUrl'), editor.value);
-        editor.value = saved;
         dirty = false;
+        if (reloadOnSave) {
+          // What was published shows up in the rest of the page, and the messages
+          // the server queued for it are waiting on the next request.
+          say('Saved. Reloading…', 'ok');
+          window.location.reload();
+          return;
+        }
+        editor.value = saved;
         say('Saved.', 'ok');
       } catch (error) {
         say(error.message, 'error');

@@ -6,6 +6,7 @@ version is immutable and records will pin it for as long as they live.
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,11 +37,16 @@ __all__ = [
     "ValidationReport",
     "archive_version",
     "clone_version",
+    "next_version_label",
     "publish_version",
     "rebase_record",
     "set_default_version",
     "validate_version",
 ]
+
+# The trailing number of a version label, which is the part that gets bumped.  Anchored
+# at the end rather than parsing the label as a whole, so "2024.1" and "v3" both work.
+_TRAILING_NUMBER = re.compile(r"^(?P<stem>.*?)(?P<number>\d+)$")
 
 
 @dataclass
@@ -238,6 +244,39 @@ def archive_version(version: StateMachineVersion, *, replacement: Any = None) ->
     version.lifecycle = Lifecycle.ARCHIVED
     version.save(update_fields=["lifecycle", "modified_at"])
     invalidate_graph(version.pk)
+
+
+def next_version_label(machine: StateMachine, *, after: str | None = None) -> str:
+    """The label the machine's next version should carry.
+
+    Bumps the trailing number of the label it follows -- ``"1"`` to ``"2"``, ``"2024.1"``
+    to ``"2024.2"``, ``"v3"`` to ``"v4"`` -- and falls back to appending one when there
+    is no number to bump.  Labels already taken are skipped, so this stays usable on a
+    machine whose versions were not numbered in order.
+
+    Args:
+        machine: The machine the version belongs to.
+        after: The label to follow.  Defaults to the machine's latest version.
+
+    Returns:
+        A label no version of ``machine`` is using yet.
+    """
+    taken = set(machine.versions.values_list("version", flat=True))
+    if after is None:
+        latest = machine.latest_version()
+        after = latest.version if latest is not None else "0"
+
+    match = _TRAILING_NUMBER.match(after)
+    if match is None:
+        stem, number = f"{after}-", 1
+    else:
+        stem, number = match["stem"], int(match["number"])
+
+    candidate = f"{stem}{number + 1}"
+    while candidate in taken:
+        number += 1
+        candidate = f"{stem}{number + 1}"
+    return candidate
 
 
 @transaction.atomic
