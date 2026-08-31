@@ -1,3 +1,27 @@
+/* Chrome around the canvas: the bar above it, and the box it sits in.
+ *
+ * The component itself needs none of this. Every element it registers attaches an
+ * open shadow root and injects its own styles inside it, so no admin stylesheet
+ * reaches the canvas and nothing here has to defend it. What crosses the boundary
+ * is what CSS lets cross by design: inherited properties, which the component
+ * overrides on its own root, and custom properties, which are its theming API.
+ *
+ * That API is the one thing to be careful with. `--sme-surface`, `--sme-canvas`
+ * and `--sme-accent` are each defined twice inside the component -- once for its
+ * dark theme and once under `:host([theme='light'])` -- and a custom property set
+ * from out here beats the `:host` rule that defines it, because the outer tree
+ * wins over shadow rules. So setting any of them from the admin's palette does not
+ * tint the canvas, it punches three holes in whichever theme is in force.
+ * `admin-editor.js` forwards the admin's *scheme* to the `theme` attribute
+ * instead, and the component colours itself coherently from there.
+ *
+ * Two admins have to be satisfied for the rest: Django's own, and Unfold, which
+ * restyles the admin's markup vocabulary but defines none of its CSS variables.
+ * Every `var()` below therefore names the admin variable it prefers *and* a
+ * fallback that reads on a light and a dark page alike -- not, as these once were,
+ * Django's light-mode value hard-coded for everyone else.
+ */
+
 .dsm-editor {
   margin: 0 0 1rem;
 }
@@ -11,30 +35,29 @@
 
 .dsm-editor__status {
   font-size: 0.8125rem;
-  color: var(--body-quiet-color, #666);
+  color: var(--body-quiet-color, #6b7280);
 }
 
 .dsm-editor__status--ok {
-  color: var(--object-tools-bg, #417690);
+  color: var(--object-tools-bg, #16a34a);
 }
 
 .dsm-editor__status--dirty {
-  color: var(--body-quiet-color, #666);
+  color: var(--body-quiet-color, #6b7280);
 }
 
 .dsm-editor__status--error {
-  color: var(--error-fg, #ba2121);
+  color: var(--error-fg, #dc2626);
 }
 
 .dsm-editor state-machine-editor {
+  /* An unknown element is inline until told otherwise, and an inline box cannot
+     take the height the canvas needs. */
   display: block;
   height: 70vh;
   min-height: 420px;
-  border: 1px solid var(--hairline-color, #e8e8e8);
+  /* Grey at partial opacity rather than a light hairline: it darkens a light page
+     and lightens a dark one, which is what an admin-agnostic default has to do. */
+  border: 1px solid var(--hairline-color, rgba(128, 128, 128, 0.35));
   border-radius: 4px;
-  /* The component themes itself from these; borrowing the admin's variables keeps
-     the canvas in step with light and dark mode without a second palette. */
-  --sme-accent: var(--primary, #417690);
-  --sme-surface: var(--body-bg, #fff);
-  --sme-canvas: var(--darkened-bg, #f8f8f8);
 }

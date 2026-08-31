@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-31
+
 ### Added
 
 - **Editing a machine publishes a new version.** A `StateMachine`'s change form now carries
@@ -41,6 +43,32 @@ All notable changes to this project are documented here. The format follows
 - The canvas partial takes its save-button label, its read-only note and whether landing a
   save reloads the page from the admin rendering it, so the two forms can say what their own
   save actually does.
+- The bundled `vinta-state-machine-editor` moves from 0.5.0 to **0.7.0**. 0.6.0 replaced the
+  browser's own `confirm()` with a dialog of the component's making, and 0.7.0 added theming
+  and overridable icons. The document schema is unchanged across both, so nothing that reads
+  or writes a canvas document had to move.
+- The canvas follows the admin's colour scheme, on Django's own admin and on
+  [Unfold](https://unfoldadmin.com/). The component defaults to dark and deliberately never
+  reads `prefers-color-scheme` — an embedded canvas should look like the page around it, not
+  like the machine it runs on — so the glue forwards whichever scheme the surrounding admin
+  settled on. The two announce it differently, both on `<html>`: Unfold writes the resolved
+  scheme to the class list, having already settled `auto` against the media query itself,
+  while Django writes the unresolved choice to `data-theme` and leaves `auto` to its
+  stylesheet. Without this the upgrade would have framed a dark canvas in a light admin.
+- The canvas no longer takes any of its palette from the admin's CSS variables. It used to
+  set `--sme-accent`, `--sme-surface` and `--sme-canvas` from `--primary`, `--body-bg` and
+  `--darkened-bg`, which was wrong twice over: the component defines each of those tokens
+  once per theme, and a custom property set from outside a shadow tree beats the `:host`
+  rule defining it, so three admin colours punched holes in whichever theme was in force;
+  and on an admin that defines no such variables — Unfold defines none of them — they
+  collapsed to Django's light-mode values hard-coded, on a page that may well be dark. The
+  scheme is forwarded instead and the component colours itself. What chrome remains outside
+  the canvas keeps its `var()` on the admin's variable but falls back to a value that reads
+  on a light and a dark page alike.
+
+  Nothing had to be done to isolate the component itself: every element it registers
+  attaches an open shadow root and styles itself inside it, so no admin stylesheet — Unfold's
+  Tailwind included — reaches the canvas.
 
 ## [0.3.0] - 2026-08-30
 
@@ -247,7 +275,8 @@ package; if this is your first install, only **Added** applies.
   leaving the same state, so the two sort identically; `define_machine` still numbers
   across the version.
 
-[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/vintasoftware/vinta-django-state-machines/releases/tag/v0.1.0

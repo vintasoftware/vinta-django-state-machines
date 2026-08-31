@@ -1,5 +1,10 @@
 // Glue between the admin change form and <state-machine-editor>.
 //
+// It also forwards the admin's colour scheme to the canvas: the component defaults
+// to dark and never reads `prefers-color-scheme` itself, so without this a light
+// admin would frame a dark editor. Django's admin and Unfold say which scheme is in
+// force in different ways; see the theme section below.
+//
 // Everything the component needs from the server is injected rather than fetched by
 // the component itself: the machine document, the side-effect and action catalogs and
 // the guard validator all come from endpoints on this ModelAdmin, whose URLs are on
@@ -63,6 +68,49 @@ if (container) {
   editor.sideEffectProvider = () => getJson(url('sideEffectsUrl'));
   editor.actionProvider = () => getJson(url('actionsUrl'));
   editor.guardValidator = (expression) => postJson(url('guardUrl'), { expression });
+
+  // -- theme: follow the admin's scheme --------------------------------------
+  //
+  // The component defaults to dark and deliberately ignores `prefers-color-scheme`,
+  // on the grounds that an embedded canvas should look like the page around it
+  // rather than like the machine it runs on. That makes the surrounding admin's
+  // choice the one to forward — and the two admins worth supporting announce it
+  // differently, both on <html>:
+  //
+  // * Unfold, and other Tailwind based themes, put the *resolved* scheme on the
+  //   class list. It settles `auto` against the media query itself before writing
+  //   one, so a class, when present, is already the answer.
+  // * Django's own toggle writes the *unresolved* choice to `data-theme`, leaving
+  //   `auto` to its stylesheet's media query — so `auto` falls through here too.
+  const media = window.matchMedia
+    ? window.matchMedia('(prefers-color-scheme: dark)')
+    : null;
+
+  const adminTheme = () => {
+    const root = document.documentElement;
+    if (root.classList.contains('dark')) return 'dark';
+    if (root.classList.contains('light')) return 'light';
+    const chosen = root.dataset.theme;
+    if (chosen === 'light' || chosen === 'dark') return chosen;
+    // `auto`, or an admin with no toggle at all.
+    return media && media.matches ? 'dark' : 'light';
+  };
+
+  const syncTheme = () => {
+    editor.theme = adminTheme();
+  };
+
+  syncTheme();
+  // Both admins rewrite the attribute in place; neither dispatches anything to
+  // listen for, so the element has to be watched.
+  new MutationObserver(syncTheme).observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['data-theme', 'class'],
+  });
+  // Only bites while the admin is on `auto` and said so by writing nothing, but it
+  // costs nothing to keep attached: `adminTheme` re-reads the element first and
+  // never reaches the query when the admin has settled the question itself.
+  if (media) media.addEventListener('change', syncTheme);
 
   let dirty = false;
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vinta-django-state-machines"
-version = "0.3.0"
+version = "0.4.0"
 description = "Data-driven, versioned state machines for Django: a status catalog, published state-machine versions pinned per record, guarded transitions and an append-only status history."
 readme = "README.md"
 requires-python = ">=3.10"
