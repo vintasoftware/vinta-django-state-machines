@@ -9,16 +9,17 @@ declares one setting::
         "PERMISSION_CHECKER": "myproject.perms.can_transition",
     }
 
-The two *model* settings are the exception. ``Meta.swappable`` resolves against a top
-level name, so they are declared alongside ``AUTH_USER_MODEL`` rather than inside the
-dict::
+The *model* settings are the exception. ``Meta.swappable`` resolves against a top level
+name, so they are declared alongside ``AUTH_USER_MODEL`` rather than inside the dict::
 
     STATE_MACHINES_SCOPE_MODEL = "organizations.OrganizationScope"
     STATE_MACHINES_IDENTITY_MODEL = "accounts.PrincipalIdentity"
+    STATE_MACHINES_BATCH_MODEL = "imports.ImportBatch"
 """
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 from django.conf import settings
@@ -37,9 +38,13 @@ DEFAULT_SCOPE_MODEL = "state_machines.StateMachineScope"
 IDENTITY_MODEL_SETTING = "STATE_MACHINES_IDENTITY_MODEL"
 DEFAULT_IDENTITY_MODEL = "state_machines.StateMachineIdentity"
 
+BATCH_MODEL_SETTING = "STATE_MACHINES_BATCH_MODEL"
+DEFAULT_BATCH_MODEL = "state_machines.StatusBatch"
+
 SWAPPABLE_DEFAULTS: tuple[tuple[str, str], ...] = (
     (SCOPE_MODEL_SETTING, DEFAULT_SCOPE_MODEL),
     (IDENTITY_MODEL_SETTING, DEFAULT_IDENTITY_MODEL),
+    (BATCH_MODEL_SETTING, DEFAULT_BATCH_MODEL),
 )
 
 
@@ -78,6 +83,12 @@ def identity_model_path() -> str:
     return value
 
 
+def batch_model_path() -> str:
+    """Dotted ``app_label.ModelName`` of the model a fan-out batch is recorded on."""
+    value: str = getattr(settings, BATCH_MODEL_SETTING, DEFAULT_BATCH_MODEL)
+    return value
+
+
 DEFAULTS: dict[str, Any] = {
     # Pin ``state_machine.default_version`` on newly created rows and fill the status
     # field from the version's initial state when it was left blank.
@@ -112,9 +123,22 @@ DEFAULTS: dict[str, Any] = {
     "CACHE_GRAPHS": True,
     # Lifecycle values a version must have for records to transition under it.
     "TRANSITIONABLE_LIFECYCLES": ("published",),
+    # Dotted path to ``dispatch(operation, batch_id) -> None``, which decides where a
+    # batch's join and cancel cascade actually run.  ``None`` runs them inline, in
+    # ``transaction.on_commit``: correct, synchronous in tests, and fine for a small
+    # fan-out.  A project with a queue points this at a function that enqueues.
+    "BATCH_DISPATCHER": None,
+    # How deep batches may nest before ``open_batch`` refuses.  A machine whose child
+    # machine is (transitively) itself would otherwise recurse without end.
+    "MAX_BATCH_DEPTH": 10,
+    # How long a batch may sit in ``joining`` before the sweeper assumes the worker
+    # died and dispatches the join again.  A batch may override this per row.
+    "BATCH_JOIN_RETRY_AFTER": timedelta(minutes=5),
 }
 
-_IMPORT_STRINGS = frozenset({"PERMISSION_CHECKER", "SCOPE_RESOLVER", "IDENTITY_RESOLVER"})
+_IMPORT_STRINGS = frozenset(
+    {"PERMISSION_CHECKER", "SCOPE_RESOLVER", "IDENTITY_RESOLVER", "BATCH_DISPATCHER"}
+)
 
 _cache: dict[str, Any] = {}
 

@@ -77,3 +77,43 @@ class HookEvent(models.TextChoices):
     ANY_TRANSITION = "any_transition", _("Any transition of the version")
     ENTER_STATE = "enter_state", _("Entering a specific state")
     LEAVE_STATE = "leave_state", _("Leaving a specific state")
+
+
+class BatchLifecycle(models.TextChoices):
+    """Where a :class:`~vinta_state_machines.models.StatusBatch` is in its own life.
+
+    ``OPEN`` accepts children and their reports.  ``JOINING`` has been claimed by
+    exactly one worker, which is on its way to move the parent.  ``CLOSED`` moved it.
+    ``ABANDONED`` never will -- the parent was cancelled out from under the batch, or
+    the join failed so persistently that giving up was the only move left.
+
+    A timeout is deliberately *not* here: a timed-out batch still has to move its
+    parent out of the waiting state, so it goes to ``JOINING`` like any other ending
+    and says why in ``failure_reason``.
+    """
+
+    OPEN = "open", _("Open")
+    JOINING = "joining", _("Joining")
+    CLOSED = "closed", _("Closed")
+    ABANDONED = "abandoned", _("Abandoned")
+
+    @classmethod
+    def live(cls) -> tuple[str, ...]:
+        """The values that mean "this batch still owns its record"."""
+        return (cls.OPEN.value, cls.JOINING.value)
+
+
+class BatchFailureReason(models.TextChoices):
+    """Why a batch ended badly, as a short code a guard can compare against.
+
+    Deliberately *not* passed as ``choices`` on the column, for the same reason
+    :class:`IdentityType` is not: a project will have reasons of its own -- a quota,
+    an upstream outage, a kill switch -- and should be able to record them without a
+    migration.  These are only the values the app itself produces.
+
+    The human-readable half lives in ``failure_detail``, which nothing branches on.
+    """
+
+    TIMEOUT = "timeout", _("Timed out")
+    CANCELLED = "cancelled", _("Cancelled")
+    JOIN_FAILED = "join_failed", _("Join failed")

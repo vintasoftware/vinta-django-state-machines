@@ -11,8 +11,9 @@ from django.db import models
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
-from vinta_state_machines.conf import identity_model_path, scope_model_path
+from vinta_state_machines.conf import batch_model_path, identity_model_path, scope_model_path
 from vinta_state_machines.enums import (
+    BatchLifecycle,
     HookEvent,
     HookTiming,
     IdentityType,
@@ -22,6 +23,7 @@ from vinta_state_machines.enums import (
 )
 from vinta_state_machines.querysets import (
     StateMachineVersionQuerySet,
+    StatusBatchQuerySet,
     StatusTransitionQuerySet,
 )
 from vinta_state_machines.types import IdentitySnapshot
@@ -1002,3 +1004,271 @@ class StateMachineHook(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.timing}:{self.event} -> {self.handler_key}"
+
+
+# --------------------------------------------------------------------- fan-out
+
+
+class AbstractStatusBatch(TimeStampedModel):
+    """A record waiting on a set of children, and what happens when they finish.
+
+    Opened while a record enters a state that fans work out; closed when every child
+    has arrived somewhere final.  Closing fires :attr:`join_action` on the parent as
+    an ordinary transition, so the move is guarded, permissioned and written to the
+    history like any other.
+
+    The counters are a fast approximation.  What a child was actually counted by is
+    the *stamp* it carries, and the sweeper repairs the counters from the stamps, so
+    every write here is ordered to leave the stamps right and the counter wrong rather
+    than the other way around.
+
+    Children are ordinary status-bearing records pointing back with a foreign key, so
+    a child that opens a batch of its own is simply a parent one level down.  That is
+    the whole of nesting; there is nothing else to it.
+    """
+
+    # ------------------------------------------------------------ who is waiting
+    target_type = models.ForeignKey(
+        ContentType,
+        verbose_name=_("target type"),
+        on_delete=models.CASCADE,
+        related_name="+",
+    )
+    target_id = models.CharField(_("target id"), max_length=64, db_index=True)
+    target = GenericForeignKey("target_type", "target_id")
+
+    status_field = models.CharField(
+        _("status field"),
+        max_length=100,
+        default="status",
+        help_text=_("Which status column is waiting, for entities that have more than one."),
+    )
+    opened_in_status = models.ForeignKey(
+        StatusDefinition,
+        verbose_name=_("opened in status"),
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text=_("The state the record was sitting in when the work was fanned out."),
+    )
+    state_machine_version = models.ForeignKey(
+        StateMachineVersion,
+        verbose_name=_("state machine version"),
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text=_("The version that authorised the fan-out, and that the join runs under."),
+    )
+
+    # -------------------------------------------------- what ends it, and as whom
+    join_action = models.ForeignKey(
+        ActionType,
+        verbose_name=_("join action"),
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text=_(
+            "Fired on the parent for every ending -- clean, partial, total failure and "
+            "timeout alike. Guards on the edges decide where it lands."
+        ),
+    )
+    actor = models.ForeignKey(
+        identity_model_path(),
+        verbose_name=_("actor"),
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text=_(
+            "Snapshotted once, when the batch opens, and reused for every child move. "
+            "One identity row per fan-out instead of one per child."
+        ),
+    )
+
+    # ------------------------------------------------------------------- the count
+    total = models.PositiveIntegerField(_("total"), default=0)
+    finished = models.PositiveIntegerField(_("finished"), default=0)
+    succeeded = models.PositiveIntegerField(_("succeeded"), default=0)
+    sealed = models.BooleanField(
+        _("sealed"),
+        default=False,
+        help_text=_(
+            "No more children will be added, so the total is final. An unsealed batch "
+            "is never complete, however the numbers look."
+        ),
+    )
+
+    # ---------------------------------------------------------- state of the batch
+    lifecycle = models.CharField(
+        _("lifecycle"),
+        max_length=20,
+        choices=BatchLifecycle.choices,
+        default=BatchLifecycle.OPEN,
+        db_index=True,
+    )
+    failure_reason = models.CharField(
+        _("failure reason"),
+        max_length=50,
+        blank=True,
+        help_text=_(
+            "Short code a guard compares against, e.g. 'timeout'. Deliberately "
+            "unconstrained: a project records reasons of its own without a migration."
+        ),
+    )
+    failure_detail = models.TextField(
+        _("failure detail"),
+        blank=True,
+        help_text=_("The human half. Nothing branches on this."),
+    )
+    timeout_at = models.DateTimeField(_("timeout at"), null=True, blank=True)
+
+    # ``joining_at`` is not redundant next to ``modified_at``: ``auto_now`` is applied
+    # by ``Model.save()``, and every write in this design is a queryset ``update()``,
+    # which bypasses it.  Anchoring the retry on ``modified_at`` would read the row's
+    # creation time and make the sweeper re-dispatch every join on its first pass.
+    joining_at = models.DateTimeField(_("joining at"), null=True, blank=True)
+    join_retry_after = models.DurationField(
+        _("join retry after"),
+        null=True,
+        blank=True,
+        help_text=_("Overrides BATCH_JOIN_RETRY_AFTER for this batch. Null uses the setting."),
+    )
+
+    # ----------------------------------------------------------------- nesting
+    depth = models.PositiveSmallIntegerField(
+        _("depth"),
+        default=0,
+        help_text=_("The parent batch's depth plus one. Capped by MAX_BATCH_DEPTH."),
+    )
+    parent_batch = models.ForeignKey(
+        "self",
+        verbose_name=_("parent batch"),
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="child_batches",
+        help_text=_("The batch this one's own parent record is counted by, if any."),
+    )
+
+    scope_key = models.CharField(
+        _("scope key"),
+        max_length=255,
+        blank=True,
+        help_text=_("Denormalised from the machine that authorised the fan-out."),
+    )
+    metadata = models.JSONField(_("metadata"), default=dict, blank=True)
+
+    objects = StatusBatchQuerySet.as_manager()
+
+    class Meta:
+        abstract = True
+        ordering = ("-created_at", "-pk")
+        constraints: ClassVar = [
+            # At most one live batch per record per status field.  This one line is
+            # what makes ``open_batch`` safe to call twice -- a hook that fires again
+            # after a retry finds the batch it already made instead of adding another
+            # -- and it is what lets the join be claimed with a single UPDATE.
+            models.UniqueConstraint(
+                fields=("target_type", "target_id", "status_field"),
+                condition=models.Q(lifecycle__in=("open", "joining")),
+                name="%(class)s_one_live_per_record",
+            ),
+        ]
+        indexes: ClassVar = [
+            models.Index(
+                fields=("target_type", "target_id", "status_field"),
+                name="%(class)s_target_idx",
+            ),
+            # What the sweeper scans on every pass.
+            models.Index(
+                fields=("lifecycle", "timeout_at"),
+                name="%(class)s_sweep_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"batch #{self.pk} ({self.finished}/{self.total})"
+
+    @property
+    def is_live(self) -> bool:
+        """Still owns its record: nobody else may open a batch on it."""
+        return self.lifecycle in BatchLifecycle.live()
+
+    @property
+    def is_complete(self) -> bool:
+        """Sealed, and every child accounted for.
+
+        Deliberately not "ready to join": a batch can also end by running out of time,
+        which is not this.
+        """
+        return self.sealed and self.finished >= self.total
+
+    @property
+    def failed(self) -> int:
+        """Children that finished without succeeding.
+
+        Not a column, because it is never written independently and a third counter is
+        a third thing to keep honest.
+        """
+        return max(self.finished - self.succeeded, 0)
+
+    @property
+    def progress(self) -> float:
+        """How far along, between 0 and 1. An empty batch is done by definition."""
+        if self.total <= 0:
+            return 1.0
+        return min(self.finished / self.total, 1.0)
+
+
+class StatusBatch(AbstractStatusBatch):
+    """The batch model this app ships. See :class:`AbstractStatusBatch`.
+
+    Swappable, like the scope and identity models, because a project will want to hang
+    its own columns here -- the queue's job id, an error payload, a link to whatever
+    kicked the work off.
+    """
+
+    class Meta(AbstractStatusBatch.Meta):
+        abstract = False
+        verbose_name = _("status batch")
+        verbose_name_plural = _("status batches")
+        swappable = "STATE_MACHINES_BATCH_MODEL"
+
+
+class StatusBatchReport(TimeStampedModel):
+    """One row per opaque unit of work that reported in. Deleted when the batch ends.
+
+    A governed child stamps *itself* -- a column on the record says it was counted --
+    so it never appears here.  This table is that same stamp kept somewhere else, for
+    work that has no record to keep it on.
+
+    Which is the honest cost of the opaque path: idempotency needs one row per unit of
+    work, and that is the row the opaque path exists to avoid.  It is a much smaller
+    row, and it does not outlive the batch, but it is not free.
+    """
+
+    batch = models.ForeignKey(
+        batch_model_path(),
+        verbose_name=_("batch"),
+        on_delete=models.CASCADE,
+        related_name="reports",
+    )
+    key = models.CharField(
+        _("key"),
+        max_length=255,
+        help_text=_(
+            "Whatever identifies this unit of work to its caller. Must name the work "
+            "itself, not the attempt: a task id dedupes a retry but not a re-enqueue."
+        ),
+    )
+    outcome = models.CharField(_("outcome"), max_length=20)
+
+    class Meta:
+        verbose_name = _("status batch report")
+        verbose_name_plural = _("status batch reports")
+        ordering = ("batch", "pk")
+        constraints: ClassVar = [
+            # The whole protection. An insert that loses this race counts nothing.
+            models.UniqueConstraint(
+                fields=("batch", "key"),
+                name="statusbatchreport_unique_key_per_batch",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.key} -> {self.outcome}"

@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     # Quoted below, because models.py imports this module: the real import would cycle.
     from vinta_state_machines.models import (  # noqa: F401
         StateMachineVersion,
+        StatusBatch,
         StatusTransition,
     )
 
@@ -68,4 +69,50 @@ class StatusTransitionQuerySet(models.QuerySet["StatusTransition"]):
             "transition",
             "state_machine_version",
             "actor",
+        )
+
+
+class StatusBatchQuerySet(models.QuerySet["StatusBatch"]):
+    def for_object(
+        self, instance: models.Model, *, status_field: str | None = None
+    ) -> StatusBatchQuerySet:
+        """Every batch ever opened on one record, newest first."""
+        queryset = self.filter(
+            target_type=ContentType.objects.get_for_model(instance, for_concrete_model=False),
+            target_id=str(instance.pk),
+        )
+        if status_field is not None:
+            queryset = queryset.filter(status_field=status_field)
+        return queryset
+
+    def live(self) -> StatusBatchQuerySet:
+        """Batches that still own their record: open, or already claimed for the join."""
+        return self.filter(lifecycle__in=("open", "joining"))
+
+    def open(self) -> StatusBatchQuerySet:
+        return self.filter(lifecycle="open")
+
+    def joining(self) -> StatusBatchQuerySet:
+        return self.filter(lifecycle="joining")
+
+    def complete(self) -> StatusBatchQuerySet:
+        """Sealed, with every child accounted for. Says nothing about the lifecycle."""
+        return self.filter(sealed=True, finished__gte=models.F("total"))
+
+    def with_progress(self) -> StatusBatchQuerySet:
+        """Annotate ``progress_ratio``, so a changelist can order by least done first.
+
+        Deliberately not called ``progress``: that name is the model's own property,
+        which answers without a query and would refuse to be overwritten by an
+        annotation.
+        """
+        return self.annotate(
+            progress_ratio=models.Case(
+                models.When(total=0, then=models.Value(1.0)),
+                default=models.ExpressionWrapper(
+                    models.F("finished") * 1.0 / models.F("total"),
+                    output_field=models.FloatField(),
+                ),
+                output_field=models.FloatField(),
+            )
         )
