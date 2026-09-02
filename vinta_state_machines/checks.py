@@ -1,7 +1,8 @@
 """System checks for status bearing models.
 
 These catch the mistakes that would otherwise only surface the first time a record tries
-to move: a status field whose companion pin is missing, or points somewhere else.
+to move: a status field whose companion pin is missing, or points somewhere else, and a
+batch field whose companion stamp cannot hold the value that means "not counted".
 """
 
 from __future__ import annotations
@@ -12,7 +13,11 @@ from django.apps import apps
 from django.core.checks import Error, Warning as CheckWarning, register
 from django.db import models
 
-from vinta_state_machines.fields import StateMachineVersionField, status_fields_of
+from vinta_state_machines.fields import (
+    StateMachineVersionField,
+    batch_fields_of,
+    status_fields_of,
+)
 
 VERSION_MODEL = "state_machines.StateMachineVersion"
 
@@ -205,3 +210,62 @@ def _is_abstract_hook(base: type[models.Model], hook: str) -> bool:
     func = getattr(func, "__func__", func)
     code = getattr(func, "__code__", None)
     return code is not None and "NotImplementedError" in (code.co_names or ())
+
+
+@register("models")
+def check_batch_fields(app_configs: Any = None, **kwargs: Any) -> list[Any]:
+    """Every :class:`StatusBatchField` must have a usable companion stamp field."""
+    issues: list[Any] = []
+    models_to_check = (
+        apps.get_models()
+        if app_configs is None
+        else [model for config in app_configs for model in config.get_models()]
+    )
+    for model in models_to_check:
+        for field in batch_fields_of(model):
+            issues.extend(_check_batch_field(model, field))
+    return issues
+
+
+def _check_batch_field(model: type[models.Model], field: Any) -> list[Any]:
+    label = f"{model._meta.label}.{field.name}"
+    try:
+        companion = model._meta.get_field(field.reported_at_field)
+    except Exception:
+        return [
+            Error(
+                f"{label} has no companion stamp field {field.reported_at_field!r}.",
+                hint=(
+                    "Declare it alongside the batch field:\n"
+                    f"    {field.reported_at_field} = BatchReportedAtField()\n"
+                    "or point the batch field elsewhere with "
+                    "StatusBatchField(reported_at_field=...)."
+                ),
+                obj=model,
+                id="state_machines.E009",
+            )
+        ]
+    if not isinstance(companion, models.DateTimeField):
+        return [
+            Error(
+                f"{label}'s companion field {field.reported_at_field!r} is a "
+                f"{type(companion).__name__}, not a DateTimeField.",
+                hint="Use BatchReportedAtField().",
+                obj=model,
+                id="state_machines.E010",
+            )
+        ]
+    if not companion.null:
+        return [
+            Error(
+                f"{label}'s companion field {field.reported_at_field!r} is not nullable.",
+                hint=(
+                    "An un-counted child has no stamp, and un-counting one clears it. "
+                    "NULL is the value that means 'not counted', and the conditional "
+                    "UPDATE that makes counting idempotent filters on it."
+                ),
+                obj=model,
+                id="state_machines.E011",
+            )
+        ]
+    return []

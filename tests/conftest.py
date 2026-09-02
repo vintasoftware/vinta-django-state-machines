@@ -123,3 +123,11 @@ def privileged_user(db) -> User:
         Permission.objects.get(content_type__app_label="testapp", codename="change_risk")
     )
     return User.objects.get(pk=account.pk)
+
+
+@pytest.fixture
+def import_run(db):
+    """A parent record. Its machine is not defined here; these tests do not move it."""
+    from tests.testapp.models import ImportRun
+
+    return ImportRun.objects.create(label="nightly")

@@ -1214,6 +1214,43 @@ class AbstractStatusBatch(TimeStampedModel):
             return 1.0
         return min(self.finished / self.total, 1.0)
 
+    # ------------------------------------------------------------------ members
+    def member_querysets(self) -> list[models.QuerySet[Any]]:
+        """One queryset per kind of record pointing at this batch.
+
+        A batch is never told what its children are.  It finds them by asking which
+        models declare a ``StatusBatchField``, which is what lets one batch count two
+        different kinds of record without anybody configuring that.
+        """
+        from vinta_state_machines.fields import batch_member_relations
+
+        return [
+            relation.related_model._default_manager.filter(**{relation.field.name: self.pk})
+            for relation in batch_member_relations(type(self))
+        ]
+
+    def count_members(self) -> int:
+        """How many children point at this batch. What :meth:`seal` fixes the total to."""
+        return sum(queryset.count() for queryset in self.member_querysets())
+
+    def count_stamped_members(self) -> int:
+        """How many children carry a stamp.
+
+        The authority the sweeper repairs :attr:`finished` against, because the stamps
+        are the truth and the counter is the approximation.
+        """
+        from vinta_state_machines.fields import batch_member_relations
+
+        return sum(
+            relation.related_model._default_manager.filter(
+                **{
+                    relation.field.name: self.pk,
+                    f"{relation.field.config().reported_at_field}__isnull": False,
+                }
+            ).count()
+            for relation in batch_member_relations(type(self))
+        )
+
 
 class StatusBatch(AbstractStatusBatch):
     """The batch model this app ships. See :class:`AbstractStatusBatch`.
