@@ -1,4 +1,14 @@
 {% load static %}
-{% comment %}The component and its glue, pulled in only by a form that renders a canvas.{% endcomment %}
+{% comment %}
+The component and its glue, pulled in only by a form that renders a canvas.
+
+The catalog goes first and is a classic script on purpose: it defines
+``django.gettext`` on the window, which the glue reads to label the canvas in the
+admin's active language.  A module waits for the document to be parsed either way,
+so by the time the glue runs the catalog is there.  Guarded because an empty
+``src`` would fetch the page itself: an admin that builds its own canvas context
+and leaves the URL out gets an untranslated canvas rather than a broken one.
+{% endcomment %}
 <link rel="stylesheet" href="{% static 'vinta_state_machines/admin-editor.css' %}">
+{% if dsm_editor.i18n_url %}<script src="{{ dsm_editor.i18n_url }}"></script>{% endif %}
 <script type="module" src="{% static 'vinta_state_machines/admin-editor.js' %}"></script>

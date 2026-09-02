@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+import struct
+from pathlib import Path
 from typing import Any
 
 import pytest
 from django.contrib.auth.models import User
+from django.test import override_settings
 from django.urls import reverse
+from django.utils import translation
 
+import vinta_state_machines
 from vinta_state_machines.editor import to_editor_machine
 from vinta_state_machines.enums import HookEvent, Lifecycle
 from vinta_state_machines.models import StateMachine, StateMachineHook, StateMachineVersion
@@ -53,6 +59,8 @@ def test_the_vendored_component_is_installed_alongside_the_glue(as_staff):
 
     assert finders.find("vinta_state_machines/state-machine-editor.js")
     assert finders.find("vinta_state_machines/admin-editor.js")
+    # Imported by the glue, so a missing one takes the whole canvas with it.
+    assert finders.find("vinta_state_machines/editor-strings.js")
 
 
 def test_a_published_version_renders_the_canvas_read_only(as_staff, risk_version):
@@ -435,3 +443,149 @@ def test_a_viewer_without_change_permission_cannot_publish_from_the_machine_canv
     )
     assert response.status_code == 404
     assert StateMachineVersion.objects.count() == 1
+
+
+# ------------------------------------------------- the canvas in the admin's language
+#
+# The component ships English and takes no view on locales, so the labels are marked in
+# `editor-strings.js` and served as a ``djangojs`` catalog beside the other endpoints.
+# What follows walks that path end to end: a project's own translation, the catalog it
+# comes out of, and the strings file that reads it.
+
+
+STRINGS_JS = (
+    Path(vinta_state_machines.__file__).parent / "static/vinta_state_machines/editor-strings.js"
+)
+BUNDLE_JS = (
+    Path(vinta_state_machines.__file__).parent
+    / "static/vinta_state_machines/state-machine-editor.js"
+)
+
+#: Every group of `EditorStrings`, which the file below has to name exactly.
+STRING_GROUPS = frozenset(
+    {
+        "toolbar",
+        "canvas",
+        "kind",
+        "card",
+        "state",
+        "color",
+        "rename",
+        "transition",
+        "startNode",
+        "source",
+        "chip",
+        "phase",
+        "trigger",
+        "triggerVerb",
+        "sideEffect",
+        "sideEffects",
+        "row",
+        "params",
+        "properties",
+        "change",
+        "dialog",
+        "organize",
+        "json",
+        "seed",
+    }
+)
+
+
+def i18n_url() -> str:
+    return reverse("admin:state_machines_statemachineversion_editor_i18n")
+
+
+def write_mo(path: Path, catalog: dict[str, str]) -> None:
+    """A compiled catalog, so the test needs no gettext toolchain to make one.
+
+    Plural entries are the gettext convention: ``singular\\0plural`` as the key,
+    the forms joined the same way as the value.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keys = sorted(catalog)
+    ids = b"".join(key.encode() + b"\0" for key in keys)
+    strings = b"".join(catalog[key].encode() + b"\0" for key in keys)
+    id_table_offset = 7 * 4 + 16 * len(keys)
+    string_table_offset = id_table_offset + len(ids)
+
+    tables = b""
+    id_at, string_at = 0, 0
+    for key in keys:
+        msgid = key.encode()
+        tables += struct.pack("<II", len(msgid), id_table_offset + id_at)
+        id_at += len(msgid) + 1
+    for key in keys:
+        msgstr = catalog[key].encode()
+        tables += struct.pack("<II", len(msgstr), string_table_offset + string_at)
+        string_at += len(msgstr) + 1
+
+    header = struct.pack("<IIIIIII", 0x950412DE, 0, len(keys), 7 * 4, 7 * 4 + 8 * len(keys), 0, 0)
+    path.write_bytes(header + tables + ids + strings)
+
+
+def test_the_change_form_loads_the_catalog_before_the_glue(as_staff, risk_draft):
+    """Order matters: the glue reads `django.gettext` as it labels the canvas."""
+    url = reverse("admin:state_machines_statemachineversion_change", args=[risk_draft.pk])
+    body = as_staff.get(url).content.decode()
+    catalog = body.index(f'<script src="{i18n_url()}">')
+    glue = body.index("/static/vinta_state_machines/admin-editor.js")
+    assert catalog < glue
+
+
+def test_the_catalog_is_served_as_a_gettext_library(as_staff):
+    response = as_staff.get(i18n_url())
+    assert response.status_code == 200
+    assert "javascript" in response["Content-Type"]
+    body = response.content.decode()
+    # What `editor-strings.js` calls, and the plural rule that makes it worth serving.
+    assert "django.gettext" in body
+    assert "django.ngettext" in body
+    assert "django.pluralidx" in body
+
+
+def test_an_anonymous_visitor_cannot_read_the_catalog(client):
+    response = client.get(i18n_url())
+    assert response.status_code == 302
+    assert "/login/" in response["Location"]
+
+
+def test_a_project_translation_reaches_the_canvas(as_staff, tmp_path):
+    """A ``djangojs`` catalog on ``LOCALE_PATHS`` is what a project actually writes."""
+    header = "Content-Type: text/plain; charset=UTF-8\nPlural-Forms: nplurals=2; plural=(n > 1);\n"
+    write_mo(
+        tmp_path / "fr" / "LC_MESSAGES" / "djangojs.mo",
+        {
+            "": header,
+            "Add state": "Ajouter un état",
+            "%(count)s item\0%(count)s items": "%(count)s élément\0%(count)s éléments",
+        },
+    )
+    with override_settings(LOCALE_PATHS=[str(tmp_path)]), translation.override("fr"):
+        body = as_staff.get(i18n_url()).content.decode()
+
+    # The catalog rides inside the script as JSON, so anything non-ASCII is escaped.
+    def as_json(text: str) -> str:
+        return json.dumps(text)[1:-1]
+
+    assert as_json("Ajouter un état") in body
+    # Both forms travel, and the language's own rule picks between them in the browser.
+    assert as_json("%(count)s élément") in body
+    assert as_json("%(count)s éléments") in body
+    assert "(n > 1)" in body
+
+
+def test_every_string_the_glue_names_exists_in_the_component():
+    """A key the component does not have is ignored in silence, so check them here."""
+    text = STRINGS_JS.read_text(encoding="utf-8")
+    # The table itself, so the helpers above it are not mistaken for labels.
+    source = text[text.index("export const editorStrings") :]
+    bundle = BUNDLE_JS.read_text(encoding="utf-8")
+
+    groups = set(re.findall(r"^  ([A-Za-z]+): \{$", source, re.MULTILINE))
+    assert groups == STRING_GROUPS
+
+    keys = set(re.findall(r"^    '?([A-Za-z][\w-]*)'?:", source, re.MULTILINE))
+    assert len(keys) > 100, "the table lost most of itself"
+    unknown = {key for key in keys if key not in bundle}
+    assert not unknown, f"not in the vendored component: {sorted(unknown)}"

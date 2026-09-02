@@ -631,6 +631,38 @@ rows that are already there — an edge recorded history points at — and a ver
 just been created has none, so for a **new** version it is the whole list. That is what lets
 the add forms refuse a graph while the person who drew it can still fix it.
 
+### The canvas in the admin's language
+
+Every word on the canvas — the toolbar, the cards, both dialogs, and the notes under the
+save button — goes through Django's own translation machinery. The component ships English
+and knows nothing about locales, so the admin hands it a set of strings built from the
+`djangojs` catalog for whatever language the request settled on.
+
+Nothing is needed to switch it on, and a project with no translations reads exactly the
+English it read before. To translate it, write a `djangojs` catalog for the language and
+put it on `LOCALE_PATHS`, where the rest of your JavaScript translations already live. The
+msgids are the English strings themselves, marked in one file you can extract from:
+
+```bash
+xgettext --language=JavaScript --from-code=UTF-8 -o locale/djangojs.pot \
+  .venv/lib/python3.12/site-packages/vinta_state_machines/static/vinta_state_machines/editor-strings.js
+```
+
+Three things worth knowing:
+
+- **Plurals come out right.** The count belongs to the browser — how many side effects a
+  chip is showing, how many items a parameter list has — so the catalog is served as
+  JavaScript, carrying the language's own `Plural-Forms` rule, from `editor/i18n.js` beside
+  the other canvas endpoints. Russian gets its three forms; a rendered blob of singulars
+  and plurals could not have given them.
+- **Four of the strings are data rather than labels.** `State 1`, `transition`, `create`
+  and the `copy` suffix are the names a newly drawn element is *born with*, and they are
+  saved into the version. Translating them translates the graph somebody draws — including
+  a new state's vocabulary key, which is slugified from its name. Nothing structural rides
+  on them: a creation edge is one with no source, whatever it is called.
+- **The catalog is this app's, plus yours.** `LOCALE_PATHS` is always merged in, and
+  `editor_i18n_packages` on the ModelAdmin says whose app catalogs join it.
+
 ## Per-tenant machines
 
 A machine may be **scoped** to a tenant, so one organization runs a stricter approval flow
@@ -912,6 +944,12 @@ tar -xzf vinta-state-machine-editor-<version>.tgz
 cp package/dist/bundled.js \
   vinta_state_machines/static/vinta_state_machines/state-machine-editor.js
 ```
+
+A release that touches `EditorStrings` needs `editor-strings.js` looked at as well: it names
+every group and key the component has, and one it does not have is ignored in silence rather
+than refused. `test_every_string_the_glue_names_exists_in_the_component` checks the names
+against the bundle that is actually vendored, which catches a key that was renamed but not a
+group that was added.
 
 ## License
 

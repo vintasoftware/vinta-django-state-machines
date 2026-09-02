@@ -11,6 +11,7 @@ from django.db.models import Count, QuerySet
 from django.http import Http404, HttpResponse, HttpResponseNotAllowed, JsonResponse
 from django.urls import path, reverse
 from django.utils.translation import gettext, gettext_lazy as _, ngettext
+from django.views.i18n import JavaScriptCatalog
 
 from vinta_state_machines.editor import (
     EditorPayloadError,
@@ -128,11 +129,33 @@ class EditorCanvasMixin(admin.ModelAdmin):
     same whichever graph is being drawn, and an **add** form has no row to hang them
     off at all.  So they sit beside the changelist rather than under an object's URL,
     and both admins serve their own copy under their own model.
+
+    The last of them is the ``djangojs`` catalog the canvas is labelled from, which is
+    how the admin's active language reaches a component that ships English.  Django's
+    own admin serves its JavaScript the same way, under ``admin:jsi18n``; that one
+    carries ``django.contrib.admin``'s catalog rather than ours, and the two merge
+    into the same ``django.catalog`` when both are on a page.
     """
+
+    #: Whose ``djangojs`` translations the canvas is labelled from.  Naming the app
+    #: keeps the payload to ours; ``LOCALE_PATHS`` is merged in whatever is named, so
+    #: a project translates the canvas where it translates everything else.
+    editor_i18n_packages = ["vinta_state_machines"]
 
     def get_urls(self) -> list[Any]:
         prefix = f"{self.opts.app_label}_{self.opts.model_name}_editor"
         mine: list[Any] = [
+            path(
+                "editor/i18n.js",
+                # Cacheable, and staff-only for no stronger reason than that the rest
+                # of the admin is: these are the canvas's own labels, the same for
+                # everyone who can reach the form they are drawn on.
+                self.admin_site.admin_view(
+                    JavaScriptCatalog.as_view(packages=self.editor_i18n_packages),
+                    cacheable=True,
+                ),
+                name=f"{prefix}_i18n",
+            ),
             path(
                 "editor/side-effects/",
                 self.admin_site.admin_view(self.editor_side_effects_view),
@@ -179,6 +202,8 @@ class EditorCanvasMixin(admin.ModelAdmin):
     def canvas_context(self, **extra: Any) -> dict[str, Any]:
         """What the canvas partial reads, with the endpoints every mode needs."""
         context: dict[str, Any] = {
+            # Loaded before the glue, so its `django.gettext` is there to label with.
+            "i18n_url": self.editor_url("i18n"),
             "side_effects_url": self.editor_url("side_effects"),
             "actions_url": self.editor_url("actions"),
             "guard_url": self.editor_url("guard"),

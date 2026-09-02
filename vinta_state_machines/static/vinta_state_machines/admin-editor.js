@@ -8,7 +8,9 @@
 // Everything the component needs from the server is injected rather than fetched by
 // the component itself: the machine document, the side-effect and action catalogs and
 // the guard validator all come from endpoints on this ModelAdmin, whose URLs are on
-// the container's data attributes.
+// the container's data attributes.  Its labels come from one more of them: the
+// ``djangojs`` catalog, loaded ahead of this module, which `editor-strings.js` reads
+// so the canvas and the notes below speak the admin's language rather than English.
 //
 // Two modes, told apart by which of those attributes are set:
 //
@@ -22,6 +24,7 @@
 //   canvas from the machine picked in that select — a new version starts from the
 //   previous one rather than from an empty canvas.
 import './state-machine-editor.js';
+import { editorStrings, fill, gettext } from './editor-strings.js';
 
 const container = document.getElementById('dsm-editor');
 if (container) {
@@ -65,6 +68,9 @@ if (container) {
   };
 
   editor.readOnly = readOnly;
+  // Before anything is drawn: `seed` names the elements a person adds, and those
+  // names are saved into the version rather than drawn over it.
+  editor.strings = editorStrings();
   editor.sideEffectProvider = () => getJson(url('sideEffectsUrl'));
   editor.actionProvider = () => getJson(url('actionsUrl'));
   editor.guardValidator = (expression) => postJson(url('guardUrl'), { expression });
@@ -156,12 +162,17 @@ if (container) {
       show(await getJson(target));
       say(
         chosen
-          ? 'Starting from the latest version of this machine.'
-          : 'Draw the graph here; it is saved with the rest of the form.',
+          ? gettext('Starting from the latest version of this machine.')
+          : gettext('Draw the graph here; it is saved with the rest of the form.'),
       );
     } catch (error) {
       showing = null; // Let the next pick — or the same one again — retry.
-      say(`Could not load the previous version: ${error.message}`, 'error');
+      say(
+        fill(gettext('Could not load the previous version: %(reason)s'), {
+          reason: error.message,
+        }),
+        'error',
+      );
     }
   };
 
@@ -202,7 +213,12 @@ if (container) {
         // out on the way in, and that layout is real work waiting to be saved.
         if (!readOnly && !dirty) say('');
       })
-      .catch((error) => say(`Could not load the graph: ${error.message}`, 'error'));
+      .catch((error) =>
+        say(
+          fill(gettext('Could not load the graph: %(reason)s'), { reason: error.message }),
+          'error',
+        ),
+      );
   }
 
   editor.addEventListener('state-machine-change', (event) => {
@@ -213,13 +229,13 @@ if (container) {
     // to do about that here: no button to save it with and nothing to warn about.
     if (readOnly) return;
     dirty = true;
-    if (!field) say('Unsaved changes.', 'dirty');
+    if (!field) say(gettext('Unsaved changes.'), 'dirty');
   });
 
   if (saveButton) {
     saveButton.addEventListener('click', async () => {
       saveButton.disabled = true;
-      say('Saving…');
+      say(gettext('Saving…'));
       try {
         // The server is the authority on ids: a state drawn here arrives with a
         // generated one and comes back keyed by the vocabulary key it was given.
@@ -228,12 +244,12 @@ if (container) {
         if (reloadOnSave) {
           // What was published shows up in the rest of the page, and the messages
           // the server queued for it are waiting on the next request.
-          say('Saved. Reloading…', 'ok');
+          say(gettext('Saved. Reloading…'), 'ok');
           window.location.reload();
           return;
         }
         editor.value = saved;
-        say('Saved.', 'ok');
+        say(gettext('Saved.'), 'ok');
       } catch (error) {
         say(error.message, 'error');
       } finally {

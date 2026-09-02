@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-02
+
+### Added
+
+- **The canvas speaks the admin's language.** Every word the editor and its dialogs put in
+  front of a person — and the notes the glue writes under the save button — is marked in
+  `static/vinta_state_machines/editor-strings.js` and assigned to the component's `strings`
+  property, so a canvas embedded in a translated admin is no longer an island of English.
+  A project with no translations reads exactly what it read before: the msgids *are* the
+  component's own English.
+- `editor/i18n.js` on both canvas admins, Django's `JavaScriptCatalog` for the `djangojs`
+  domain, loaded ahead of the glue by `_canvas_head.html`. Serving a catalog rather than
+  rendering the strings from Python is what gets plurals right: the counts on a canvas —
+  side effects on a chip, items in a parameter list — are the browser's, and only the
+  catalog carries the language's own `Plural-Forms` rule to pick a form with. Which app
+  catalogs it carries is `editor_i18n_packages` on the ModelAdmin; `LOCALE_PATHS` is always
+  merged in, so a project translates the canvas where it translates everything else.
+- The four strings in the component's `seed` group are translated with the rest, which
+  translates the graph rather than the chrome: they are the names a newly drawn state or
+  transition is born with, and a new state's vocabulary key is slugified from its name.
+  Nothing structural rides on them — a creation edge is one with no source, whatever it is
+  called.
+
+### Changed
+
+- The bundled `vinta-state-machine-editor` moves from 0.7.0 to **0.8.0**, which puts every word
+  the canvas and its dialogs say behind an overridable `strings` property — a partial set
+  replaces only what it names, and the strings that take values are functions rather than
+  templates, so plurals and word order stay the sentence's own business. The document schema is
+  unchanged, so nothing that reads or writes a canvas document had to move. What the admin does
+  with that property is the entry above.
+
 ## [0.4.0] - 2026-08-31
 
 ### Added
@@ -275,7 +307,8 @@ package; if this is your first install, only **Added** applies.
   leaving the same state, so the two sort identically; `define_machine` still numbers
   across the version.
 
-[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.1.0...v0.2.0
