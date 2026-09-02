@@ -105,12 +105,12 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Sign with Sigstore
+      # On a release trigger the action attaches what it signed -- each dist and the
+      # `.sigstore.json` beside it -- to the release itself, which is what `contents:
+      # write` above is for.  Stated rather than left to the default, because an
+      # upload step of our own after it can only ever collide with what it wrote.
+      - name: Sign with Sigstore and attach to the release
         uses: sigstore/gh-action-sigstore-python@v3.5.0
         with:
           inputs: ./dist/*.tar.gz ./dist/*.whl
-
-      - name: Upload to the GitHub release
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" dist/** --repo "${GITHUB_REPOSITORY}"
+          release-signing-artifacts: true
