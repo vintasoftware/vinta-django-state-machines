@@ -221,22 +221,20 @@ if (container) {
       );
   }
 
-  // A fan-out crosses into another machine, and the canvas only draws one. The
-  // component says where the user wants to go and stops; this is the part that takes
-  // them there. Search rather than a direct link: a machine key is not a primary key,
-  // and the changelist already searches on it.
-  editor.addEventListener('state-machine-fan-out', (event) => {
-    const key = event.detail && event.detail.childMachine;
-    const machines = url('machinesUrl');
-    if (!key || !machines) {
-      say(gettext('This state does not name the machine its children belong to.'), 'error');
-      return;
-    }
-    if (dirty && !window.confirm(gettext('Leave this graph? Your changes are not saved.'))) {
-      return;
-    }
-    window.location.href = `${machines}?q=${encodeURIComponent(key)}`;
-  });
+  // A fan-out crosses into another machine, and the canvas only draws one. Setting a
+  // handler is what puts the link on the band: without one the band still names the
+  // machine, it just does not offer to go there, which beats a link that leads nowhere.
+  // Search rather than a direct URL: a machine key is not a primary key, and the
+  // changelist already searches on it.
+  if (url('machinesUrl')) {
+    editor.fanOutHandler = ({ childMachine }) => {
+      if (!childMachine) return;
+      if (dirty && !window.confirm(gettext('Leave this graph? Your changes are not saved.'))) {
+        return;
+      }
+      window.location.href = `${url('machinesUrl')}?q=${encodeURIComponent(childMachine)}`;
+    };
+  }
 
   editor.addEventListener('state-machine-change', (event) => {
     // Mid-drag frames are not worth marking the form dirty over.

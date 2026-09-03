@@ -44,13 +44,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
-- The bundled `vinta-state-machine-editor` moves from 0.8.0 to **0.9.0**: edges that share a
+- The bundled `vinta-state-machine-editor` moves from 0.8.0 to **0.10.0**: edges that share a
   source and an action are drawn as one decision card with ordered, reorderable rows rather
   than as unrelated cards, a waiting state grows the band above its hook lanes, a child state
   carries one `COUNTS AS` line instead of two chips, and cards carry advisory stripes for the
   problems the backend refuses at publish. Ordering is positional as it already was, so
   dragging a decision row is reordering the `transitions` array and nothing about the document
-  schema moved.
+  schema moved. 0.10.0 follows with an explicit `is_waiting: false` when a wait is switched
+  off, a stripe for a timeout of zero, and the fan-out link behind a handler.
+- The fan-out link is wired as `editor.fanOutHandler` rather than only as a
+  `state-machine-fan-out` listener. From 0.10.0 the link is drawn **only** when a handler is
+  set — an integration that listens for the event alone still receives it, and shows no link
+  to raise it from. The event is still emitted; the handler is what makes the line a link.
 - `editor-strings.js` gains the `decision`, `waiting` and `issue` groups, so the new surfaces
   are translated with the rest rather than being an island of English.
 

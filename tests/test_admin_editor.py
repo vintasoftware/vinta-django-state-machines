@@ -460,6 +460,9 @@ BUNDLE_JS = (
     Path(vinta_state_machines.__file__).parent
     / "static/vinta_state_machines/state-machine-editor.js"
 )
+GLUE_JS = (
+    Path(vinta_state_machines.__file__).parent / "static/vinta_state_machines/admin-editor.js"
+)
 
 #: Every group of `EditorStrings`, which the file below has to name exactly.
 STRING_GROUPS = frozenset(
@@ -607,3 +610,18 @@ def test_the_canvas_says_where_a_fan_out_link_goes(as_staff, risk_machine):
 
     body = response.content.decode()
     assert 'data-machines-url="/admin/state_machines/statemachine/"' in body
+
+
+def test_the_fan_out_link_is_wired_as_a_handler_not_only_an_event():
+    """Setting a handler is what puts the link on the band.
+
+    The component announces `state-machine-fan-out` either way, so an integration
+    that only listens still works -- and shows no link to work from, because a link
+    that leads nowhere is worse than no link. That is a silent regression, which is
+    what this catches.
+    """
+    glue = GLUE_JS.read_text(encoding="utf-8")
+    bundle = BUNDLE_JS.read_text(encoding="utf-8")
+
+    assert "editor.fanOutHandler" in glue
+    assert "fanOutHandler" in bundle, "the vendored component no longer takes a handler"

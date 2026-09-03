@@ -355,6 +355,7 @@ export const editorStrings = () => ({
     label: gettext('Problems with this card'),
     noFallback: gettext('No fallback — if every guard fails the record is stuck here.'),
     noJoinEdge: gettext('Nothing leaves this state when the work finishes.'),
+    zeroTimeout: gettext('A timeout of zero leaves the batch no time to finish.'),
     terminalHasExit: gettext(
       'Terminal states cannot be left, so these edges never fire.',
     ),
