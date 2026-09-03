@@ -221,6 +221,21 @@ if (container) {
       );
   }
 
+  // A fan-out crosses into another machine, and the canvas only draws one. Setting a
+  // handler is what puts the link on the band: without one the band still names the
+  // machine, it just does not offer to go there, which beats a link that leads nowhere.
+  // Search rather than a direct URL: a machine key is not a primary key, and the
+  // changelist already searches on it.
+  if (url('machinesUrl')) {
+    editor.fanOutHandler = ({ childMachine }) => {
+      if (!childMachine) return;
+      if (dirty && !window.confirm(gettext('Leave this graph? Your changes are not saved.'))) {
+        return;
+      }
+      window.location.href = `${url('machinesUrl')}?q=${encodeURIComponent(childMachine)}`;
+    };
+  }
+
   editor.addEventListener('state-machine-change', (event) => {
     // Mid-drag frames are not worth marking the form dirty over.
     if (event.detail.transient) return;

@@ -10,6 +10,8 @@ from django.contrib.admin.utils import unquote
 from django.db.models import Count, QuerySet
 from django.http import Http404, HttpResponse, HttpResponseNotAllowed, JsonResponse
 from django.urls import path, reverse
+from django.utils.html import format_html, format_html_join
+from django.utils.safestring import mark_safe
 from django.utils.translation import gettext, gettext_lazy as _, ngettext
 from django.views.i18n import JavaScriptCatalog
 
@@ -41,6 +43,7 @@ from vinta_state_machines.models import (
     StateMachineState,
     StateMachineTransition,
     StateMachineVersion,
+    StatusBatch,
     StatusDefinition,
     StatusTransition,
 )
@@ -207,6 +210,10 @@ class EditorCanvasMixin(admin.ModelAdmin):
             "side_effects_url": self.editor_url("side_effects"),
             "actions_url": self.editor_url("actions"),
             "guard_url": self.editor_url("guard"),
+            # Where a fan-out link goes. The canvas draws one machine and a fan-out
+            # crosses into another, so the component only says where the user wants
+            # to be; this is the admin answering.
+            "machines_url": reverse("admin:state_machines_statemachine_changelist"),
             # Live mode: the graph is loaded and saved on its own endpoint, beside
             # the fields. Form mode: it rides along in ``field`` and is applied when
             # the row it belongs to has been created.
@@ -663,3 +670,93 @@ class StatusTransitionAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request: HttpRequest, obj: Any = None) -> bool:
         return False
+
+
+@admin.register(StatusBatch)
+class StatusBatchAdmin(admin.ModelAdmin):
+    """What a fan-out looks like from the outside.
+
+    A snapshot, rendered server side. Refreshing the page refreshes the numbers, and
+    anyone who wants it live builds that on ``batch_tree``: the library ships the read
+    API and no refresh loop.
+    """
+
+    list_display = (
+        "__str__",
+        "target_label",
+        "opened_in_status",
+        "progress_bar",
+        "lifecycle",
+        "failure_reason",
+        "created_at",
+    )
+    list_filter = ("lifecycle", "sealed", "failure_reason", "depth")
+    search_fields = ("target_id", "scope_key", "failure_detail")
+    date_hierarchy = "created_at"
+    readonly_fields = ("batch_tree_view",)
+    ordering = ("-created_at",)
+
+    def get_queryset(self, request: Any) -> Any:
+        queryset = super().get_queryset(request)
+        return queryset.select_related(
+            "opened_in_status", "join_action", "target_type"
+        ).with_progress()  # type: ignore[attr-defined]
+
+    @admin.display(description=_("target"))
+    def target_label(self, obj: StatusBatch) -> str:
+        target = obj.target
+        return str(target) if target is not None else f"{obj.target_type.model} #{obj.target_id}"
+
+    @admin.display(description=_("progress"), ordering="progress_ratio")
+    def progress_bar(self, obj: StatusBatch) -> str:
+        """The counts, and a bar so the stuck one is findable at a glance."""
+        percent = round(obj.progress * 100)
+        colour = "#2e7d4f" if obj.failed == 0 else "#b4342b"
+        return format_html(
+            '<div style="min-width:120px">'
+            '<div style="background:#dce1e6;border-radius:3px;height:6px;overflow:hidden">'
+            '<div style="background:{};width:{}%;height:100%"></div></div>'
+            '<small style="font-variant-numeric:tabular-nums">{} / {}{}</small></div>',
+            colour,
+            percent,
+            obj.finished,
+            obj.total,
+            format_html(" &middot; {} failed", obj.failed) if obj.failed else "",
+        )
+
+    @admin.display(description=_("batch tree"))
+    def batch_tree_view(self, obj: StatusBatch) -> str:
+        """Every nested batch under this one.
+
+        Batches, not children: a run over a million rows still draws as a few rows,
+        because only batches carry ``parent_batch``.
+        """
+        from vinta_state_machines.reporting import tree_of
+
+        rows = format_html_join(
+            "",
+            '<tr><td style="padding:2px 12px 2px 0;font-family:monospace">{}{}</td>'
+            '<td style="padding:2px 12px 2px 0">{}</td>'
+            '<td style="padding:2px 12px 2px 0;font-variant-numeric:tabular-nums">'
+            "{} / {}</td><td>{}</td></tr>",
+            (
+                (
+                    mark_safe("&nbsp;" * 4 * node["depth"]),
+                    node["target"] or node["target_id"],
+                    node["opened_in_status"],
+                    node["finished"],
+                    node["total"],
+                    node["failure_reason"] or node["lifecycle"],
+                )
+                for node in _flatten(tree_of(obj))
+            ),
+        )
+        return format_html("<table>{}</table>", rows)
+
+
+def _flatten(node: dict[str, Any]) -> list[dict[str, Any]]:
+    """Depth-first, so the indentation in the table reads as the tree it is."""
+    found = [node]
+    for child in node["children"]:
+        found.extend(_flatten(child))
+    return found

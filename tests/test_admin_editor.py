@@ -460,11 +460,18 @@ BUNDLE_JS = (
     Path(vinta_state_machines.__file__).parent
     / "static/vinta_state_machines/state-machine-editor.js"
 )
+GLUE_JS = (
+    Path(vinta_state_machines.__file__).parent / "static/vinta_state_machines/admin-editor.js"
+)
 
 #: Every group of `EditorStrings`, which the file below has to name exactly.
 STRING_GROUPS = frozenset(
     {
         "toolbar",
+        # 0.9.0: the decision card, the waiting band, and the advisory stripes.
+        "decision",
+        "waiting",
+        "issue",
         "canvas",
         "kind",
         "card",
@@ -589,3 +596,32 @@ def test_every_string_the_glue_names_exists_in_the_component():
     assert len(keys) > 100, "the table lost most of itself"
     unknown = {key for key in keys if key not in bundle}
     assert not unknown, f"not in the vendored component: {sorted(unknown)}"
+
+
+def test_the_canvas_says_where_a_fan_out_link_goes(as_staff, risk_machine):
+    """The canvas draws one machine; a fan-out crosses into another.
+
+    The component only announces where the user wants to be, so without this the
+    FANS OUT TO link in a waiting state's band has nowhere to take them.
+    """
+    response = as_staff.get(
+        reverse("admin:state_machines_statemachine_change", args=[risk_machine.pk])
+    )
+
+    body = response.content.decode()
+    assert 'data-machines-url="/admin/state_machines/statemachine/"' in body
+
+
+def test_the_fan_out_link_is_wired_as_a_handler_not_only_an_event():
+    """Setting a handler is what puts the link on the band.
+
+    The component announces `state-machine-fan-out` either way, so an integration
+    that only listens still works -- and shows no link to work from, because a link
+    that leads nowhere is worse than no link. That is a silent regression, which is
+    what this catches.
+    """
+    glue = GLUE_JS.read_text(encoding="utf-8")
+    bundle = BUNDLE_JS.read_text(encoding="utf-8")
+
+    assert "editor.fanOutHandler" in glue
+    assert "fanOutHandler" in bundle, "the vendored component no longer takes a handler"

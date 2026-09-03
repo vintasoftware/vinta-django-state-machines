@@ -81,3 +81,13 @@ class ApprovalRequired(StateMachineError):
     def __init__(self, message: str, *, transition: TransitionSpec | None = None) -> None:
         super().__init__(message)
         self.transition = transition
+
+
+class BatchDepthExceeded(StateMachineError):
+    """A fan-out tried to nest deeper than ``MAX_BATCH_DEPTH`` allows.
+
+    Almost always a machine whose child machine is, transitively, itself.  Without the
+    cap that recurses until something else gives out.
+    """
+
+    default_code = "batch_depth_exceeded"

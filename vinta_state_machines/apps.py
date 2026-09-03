@@ -23,8 +23,9 @@ class StateMachinesConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
 
     def ready(self) -> None:
-        # Importing these wires the cache invalidation signals and the model checks.
-        from vinta_state_machines import checks, signals  # noqa: F401
+        # Importing these wires the cache invalidation signals, the model checks, and
+        # the app's own side-effect handlers.
+        from vinta_state_machines import batch_effects, checks, signals  # noqa: F401
         from vinta_state_machines.side_effects import autodiscover
 
         # Every installed app's ``side_effects`` module registers its handlers, so a

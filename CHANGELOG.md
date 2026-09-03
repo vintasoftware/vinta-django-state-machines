@@ -6,6 +6,59 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The canvas draws the fan-out.** A state that waits for a batch is declared on the graph —
+  `is_waiting`, `join_action`, `child_machine` and `batch_timeout` on `StateMachineState` —
+  and the editor payload carries all four in `state.data`, so the canvas can badge the state,
+  draw the band and link to the machine its children are governed by. A document that says
+  nothing about `is_waiting` round-trips exactly as it did before.
+- `counts_as` on a child machine's finished states, derived from the report bindings rather
+  than stored, so the canvas never has to match on a handler key to know that a state counts
+  towards its parent's batch. The bindings themselves are hidden from the `onEnter` /
+  `onLeave` lanes: they are one concept in two rows, and two chips invite deleting half of it.
+- `counts_as_partial`, which names the half a half-configured pair arrived carrying. The
+  editor never sees a hook row, so it cannot work this out for itself; without the key a pair
+  missing its leave half draws as though it were whole, and a leave half on its own does not
+  draw at all. `validate_version` still refuses such a graph at publish time — this is what
+  puts the same fact on the card while the person who caused it is still looking at it.
+- `data-machines-url` on the canvas, and a `state-machine-fan-out` listener in the glue. The
+  component announces that somebody asked to follow a fan-out and stops there, because a
+  canvas draws one machine and a fan-out crosses into another; this is the admin answering,
+  by searching the machine list for the child machine's key. It asks before leaving a graph
+  with unsaved changes.
+- `validate_version` refuses a waiting state whose version declares no edge under its join
+  action. The batch would complete, fire, find nothing, and leave the record waiting for
+  good — a failure that only surfaces once the work finishes.
+
+### Fixed
+
+- Turning a fan-out **off** on the canvas now persists. The component deletes `is_waiting`
+  rather than writing it false, and keeps the other three keys so a toggle pressed by
+  mistake costs nobody their join action — so absence of the flag has to be read as *off*
+  once any of its siblings is present, rather than as a document with nothing to say.
+  A state whose settings were all empty leaves nothing behind to read either way, which
+  is why the editor is separately asked to write the flag out explicitly.
+- The three settings survive the toggle in the payload as well as in the database. Kept
+  in a column but not sent back is the same as lost, one reload later.
+
+### Changed
+
+- The bundled `vinta-state-machine-editor` moves from 0.8.0 to **0.10.0**: edges that share a
+  source and an action are drawn as one decision card with ordered, reorderable rows rather
+  than as unrelated cards, a waiting state grows the band above its hook lanes, a child state
+  carries one `COUNTS AS` line instead of two chips, and cards carry advisory stripes for the
+  problems the backend refuses at publish. Ordering is positional as it already was, so
+  dragging a decision row is reordering the `transitions` array and nothing about the document
+  schema moved. 0.10.0 follows with an explicit `is_waiting: false` when a wait is switched
+  off, a stripe for a timeout of zero, and the fan-out link behind a handler.
+- The fan-out link is wired as `editor.fanOutHandler` rather than only as a
+  `state-machine-fan-out` listener. From 0.10.0 the link is drawn **only** when a handler is
+  set — an integration that listens for the event alone still receives it, and shows no link
+  to raise it from. The event is still emitted; the handler is what makes the line a link.
+- `editor-strings.js` gains the `decision`, `waiting` and `issue` groups, so the new surfaces
+  are translated with the rest rather than being an island of English.
+
 ## [0.5.0] - 2026-09-02
 
 ### Added
