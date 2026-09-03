@@ -1040,8 +1040,12 @@ class AbstractStatusBatch(TimeStampedModel):
     status_field = models.CharField(
         _("status field"),
         max_length=100,
-        default="status",
-        help_text=_("Which status column is waiting, for entities that have more than one."),
+        default="status_key",
+        help_text=_(
+            "The *model field* that is waiting, e.g. 'status_key'. Not the catalog's "
+            "status_field: this is what the join passes to transition(), and it is what "
+            "makes a record with two governed statuses able to wait on both at once."
+        ),
     )
     opened_in_status = models.ForeignKey(
         StatusDefinition,

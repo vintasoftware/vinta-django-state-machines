@@ -131,3 +131,117 @@ def import_run(db):
     from tests.testapp.models import ImportRun
 
     return ImportRun.objects.create(label="nightly")
+
+
+# ------------------------------------------------------------------- fan-out
+
+IMPORT_RUN_DEFINITION = {
+    "key": "import_run.status",
+    "entity_type": "import_run",
+    "status_field": "status",
+    "name": "Import run status",
+    "version": "1",
+    "states": [
+        {"key": "pending", "name": "Pending", "is_initial": True, "order": 0},
+        {"key": "processing", "name": "Processing", "order": 1},
+        {"key": "completed", "name": "Completed", "is_terminal": True, "order": 2},
+        {"key": "partially_failed", "name": "Partially failed", "is_terminal": True, "order": 3},
+        {"key": "failed", "name": "Failed", "is_terminal": True, "order": 4},
+        {"key": "timed_out", "name": "Timed out", "is_terminal": True, "order": 5},
+        {"key": "cancelled", "name": "Cancelled", "is_terminal": True, "order": 6},
+    ],
+    "transitions": [
+        {"name": "create", "from": None, "to": "pending", "action": "import_run.create"},
+        {"name": "start", "from": "pending", "to": "processing", "action": "import_run.start"},
+        # Four edges, one action. The engine walks them in order and takes the first
+        # whose guard holds, which is how every ending routes through one join action.
+        {
+            "name": "finish_timed_out",
+            "from": "processing",
+            "to": "timed_out",
+            "action": "import_run.finish",
+            "guard": 'metadata["batch"]["failure_reason"] == "timeout"',
+            "order": 0,
+        },
+        {
+            "name": "finish_clean",
+            "from": "processing",
+            "to": "completed",
+            "action": "import_run.finish",
+            "guard": 'metadata["batch"]["failed"] == 0',
+            "order": 1,
+        },
+        {
+            "name": "finish_partial",
+            "from": "processing",
+            "to": "partially_failed",
+            "action": "import_run.finish",
+            "guard": 'metadata["batch"]["succeeded"] > 0',
+            "order": 2,
+        },
+        {
+            "name": "finish_failed",
+            "from": "processing",
+            "to": "failed",
+            "action": "import_run.finish",
+            "order": 3,
+        },
+        {
+            "name": "cancel",
+            "from": "processing",
+            "to": "cancelled",
+            "action": "import_run.cancel",
+        },
+    ],
+}
+
+IMPORT_ROW_DEFINITION = {
+    "key": "import_row.status",
+    "entity_type": "import_row",
+    "status_field": "status",
+    "name": "Import row status",
+    "version": "1",
+    "states": [
+        {"key": "queued", "name": "Queued", "is_initial": True, "order": 0},
+        # Deliberately *not* terminal: a processed row can be reopened, which is what
+        # makes un-counting reachable at all.
+        {"key": "processed", "name": "Processed", "order": 1},
+        {"key": "rejected", "name": "Rejected", "is_terminal": True, "order": 2},
+    ],
+    "transitions": [
+        {"name": "create", "from": None, "to": "queued", "action": "import_row.create"},
+        {"name": "process", "from": "queued", "to": "processed", "action": "import_row.process"},
+        {"name": "reject", "from": "queued", "to": "rejected", "action": "import_row.reject"},
+        {"name": "reopen", "from": "processed", "to": "queued", "action": "import_row.reopen"},
+    ],
+}
+
+
+@pytest.fixture
+def run_version(db) -> StateMachineVersion:
+    import copy
+
+    version = define_machine(copy.deepcopy(IMPORT_RUN_DEFINITION))
+    publish_version(version)
+    version.refresh_from_db()
+    return version
+
+
+@pytest.fixture
+def row_version(db) -> StateMachineVersion:
+    import copy
+
+    version = define_machine(copy.deepcopy(IMPORT_ROW_DEFINITION))
+    publish_version(version)
+    version.refresh_from_db()
+    return version
+
+
+@pytest.fixture
+def waiting_run(run_version):
+    """A parent record already sitting in ``processing``, ready to fan out."""
+    from tests.testapp.models import ImportRun
+
+    record = ImportRun.objects.create(label="nightly")
+    record.transition("import_run.start")
+    return record
