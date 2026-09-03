@@ -43,6 +43,7 @@ def test_progress_reports_the_live_batch(waiting_run):
 
     progress = progress_of(waiting_run)
 
+    assert progress is not None
     assert progress["total"] == 4
     assert progress["finished"] == 1
     assert progress["progress"] == 0.25
@@ -56,6 +57,7 @@ def test_progress_falls_back_to_the_last_run_once_it_is_over(waiting_run):
 
     progress = progress_of(waiting_run)
 
+    assert progress is not None
     assert progress["lifecycle"] == BatchLifecycle.ABANDONED
     assert progress["failure_reason"] == "cancelled"
 
@@ -103,6 +105,7 @@ def test_a_tree_of_one_batch_is_one_node(waiting_run):
 
     tree = batch_tree(waiting_run)
 
+    assert tree is not None
     assert tree["children"] == []
 
 
@@ -113,6 +116,7 @@ def test_a_nested_run_nests(waiting_run, row_version):
 
     tree = batch_tree(waiting_run)
 
+    assert tree is not None
     assert len(tree["children"]) == 1
     assert tree["children"][0]["depth"] == 1
 
@@ -125,6 +129,7 @@ def test_the_tree_is_a_tree_of_batches_not_of_children(waiting_run, row_version)
 
     tree = batch_tree(waiting_run)
 
+    assert tree is not None
     assert tree["children"] == []
     assert tree["total"] == 90000
 
@@ -141,6 +146,7 @@ def test_the_tree_goes_deeper_than_one_level(waiting_run, row_version, run_versi
 
     tree = batch_tree(waiting_run)
 
+    assert tree is not None
     assert tree["children"][0]["children"][0]["depth"] == 2
 
 
@@ -162,7 +168,9 @@ def test_a_sibling_batch_of_another_record_is_not_in_the_tree(
     a_batch(waiting_run, total=1)
     open_batch(import_run, join_action="import_run.finish")
 
-    assert batch_tree(waiting_run)["children"] == []
+    tree = batch_tree(waiting_run)
+    assert tree is not None
+    assert tree["children"] == []
 
 
 # --------------------------------------------------------------------- admin
