@@ -15,6 +15,7 @@ from vinta_state_machines.batch_effects import (
 )
 from vinta_state_machines.batches import live_batch_for
 from vinta_state_machines.enums import BatchLifecycle, HookEvent, HookTiming
+from vinta_state_machines.graph import HookSpec
 from vinta_state_machines.models import StateMachineHook, StatusBatch
 from vinta_state_machines.services import validate_version
 from vinta_state_machines.side_effects import registered_side_effects
@@ -109,6 +110,17 @@ def test_opening_twice_is_harmless(run_version):
     from vinta_state_machines.side_effects import SideEffectContext
 
     graph = run.state_machine_graph()
+    binding = HookSpec(
+        pk=0,
+        handler_key=OPEN_HANDLER,
+        timing=HookTiming.AFTER,
+        event=HookEvent.ENTER_STATE,
+        transition_pk=None,
+        state_key="processing",
+        params={"join_action": "import_run.finish"},
+        order=0,
+        on_commit=False,
+    )
     open_batch_effect(
         SideEffectContext(
             instance=run,
@@ -122,7 +134,7 @@ def test_opening_twice_is_harmless(run_version):
             transition=graph.transitions[0],
             timing=HookTiming.AFTER,
             event=HookEvent.ENTER_STATE,
-            hook=None,
+            hook=binding,
             params={"join_action": "import_run.finish"},
         )
     )
