@@ -52,11 +52,20 @@ SUCCESS = "success"
 FAILURE = "failure"
 
 JOIN = "join"
+CANCEL = "cancel"
+
+CANCEL_ACTION_KEY = "child_cancel_action"
+"""Where abandon() leaves the action for the cascade, which only gets an id."""
+
+CANCEL_CHUNK = 500
+"""How many children to pull at a time. A cancel can span a very large tree."""
 
 __all__ = [
+    "CANCEL",
     "FAILURE",
     "JOIN",
     "SUCCESS",
+    "abandon",
     "batch_model",
     "count_child",
     "dispatch",
@@ -387,6 +396,9 @@ def run_batch_operation(operation: str, batch_id: int) -> None:
     if operation == JOIN:
         _run_join(batch_id)
         return
+    if operation == CANCEL:
+        _run_cancel(batch_id)
+        return
     raise ValueError(f"Unknown batch operation {operation!r}.")
 
 
@@ -409,7 +421,11 @@ def _run_join(batch_id: int) -> None:
 
     target = batch.target
     if target is None:
-        _abandon(batch, BatchFailureReason.JOIN_FAILED, "The record this batch waited on is gone.")
+        abandon(
+            batch,
+            reason=BatchFailureReason.JOIN_FAILED,
+            detail="The record this batch waited on is gone.",
+        )
         return
 
     try:
@@ -442,11 +458,96 @@ def _close(batch_id: int) -> None:
         _report_model().objects.filter(batch_id=batch_id).delete()
 
 
-def _abandon(batch: StatusBatch, reason: str, detail: str = "") -> None:
-    batch_model().objects.filter(pk=batch.pk).exclude(lifecycle=BatchLifecycle.CLOSED).update(
-        lifecycle=BatchLifecycle.ABANDONED, failure_reason=reason, failure_detail=detail
+def abandon(
+    batch: StatusBatch,
+    *,
+    reason: str,
+    detail: str = "",
+    child_cancel_action: str | None = None,
+) -> bool:
+    """Give up on a batch, so nothing it counts can ever move its parent.
+
+    Always the first half of a cancellation, and not optional.  A batch left open after
+    its parent has moved keeps taking reports, the last one claims the join, and the
+    join fires at a record that no longer has that edge -- a ``TransitionNotAllowed``
+    raised inside a background worker, long after anybody was watching.
+
+    ``child_cancel_action`` additionally tells the children to stop.  That is dispatched
+    rather than run here: cancelling a child is a real transition, which fires its own
+    side effects and abandons its own batch one level further down, and there may be a
+    million of them.
+
+    Returns:
+        Whether this call was the one that abandoned it.
+    """
+    updates: dict[str, Any] = {
+        "lifecycle": BatchLifecycle.ABANDONED,
+        "failure_reason": reason,
+        "failure_detail": detail,
+    }
+    if child_cancel_action:
+        updates["metadata"] = {**(batch.metadata or {}), CANCEL_ACTION_KEY: child_cancel_action}
+
+    abandoned = (
+        batch_model()
+        .objects.filter(pk=batch.pk)
+        .exclude(lifecycle__in=(BatchLifecycle.CLOSED, BatchLifecycle.ABANDONED))
+        .update(**updates)
     )
+    if not abandoned:
+        return False
+
     _report_model().objects.filter(batch_id=batch.pk).delete()
+    if child_cancel_action:
+        dispatch(CANCEL, batch.pk)
+    return True
+
+
+def _run_cancel(batch_id: int) -> None:
+    """Tell every unfinished child of an abandoned batch to stop.
+
+    A child whose graph has no edge for the action is **left to run**.  Nothing raises,
+    and no child machine is forced to grow a cancel edge it did not want; its eventual
+    report lands in an abandoned batch and is ignored like any other.
+
+    There is no publish-time check for a missing edge, and there cannot be: the parent's
+    hook names an action key, not a child machine, so nothing in the catalog links the
+    two.  One log line per machine and action is the most that can be said.
+    """
+    from vinta_state_machines.engine import transition
+
+    batch = batch_model().objects.filter(pk=batch_id).first()
+    if batch is None:
+        return
+    action = (batch.metadata or {}).get(CANCEL_ACTION_KEY)
+    if not action:
+        return
+
+    skipped: set[str] = set()
+    for relation in batch_member_relations(type(batch)):
+        model = relation.related_model
+        declared = status_fields_of(model)
+        if not declared:
+            continue  # nothing to move: no governed status to move it on
+        field_name = declared[0].name
+        stamp = get_batch_field_config(model, relation.field.name).reported_at_field
+        unfinished = model._default_manager.filter(
+            **{relation.field.name: batch_id, f"{stamp}__isnull": True}
+        )
+        for child in unfinished.iterator(chunk_size=CANCEL_CHUNK):
+            try:
+                transition(child, action, field_name, actor=batch.actor)
+            except StateMachineError:
+                label = f"{model._meta.label}:{action}"
+                if label not in skipped:
+                    skipped.add(label)
+                    logger.info(
+                        "Batch %s: %s declares no usable %r edge, so its children are "
+                        "left running and their reports will be ignored.",
+                        batch_id,
+                        model._meta.label,
+                        action,
+                    )
 
 
 def join_metadata(batch: StatusBatch) -> dict[str, Any]:

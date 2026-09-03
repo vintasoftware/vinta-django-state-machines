@@ -6,6 +6,10 @@ Two handlers, registered by the app itself so any version can reference them:
     Bound to entering the state that fans work out.  Opens the batch; your own handler
     then creates the children and hands them to whatever runs them.
 
+``state_machines.abandon_batch``
+    Bound to the edge that takes a record out of the state it was waiting in, most
+    often a cancel.  Stops the batch, and optionally the children with it.
+
 ``state_machines.report_to_batch``
     Bound to *both* events of every finished state.  Arriving counts the child; leaving
     un-counts it.  One registered function, two bindings, so the pair is obvious in a
@@ -23,8 +27,15 @@ from typing import TYPE_CHECKING, Any
 
 from django.utils.dateparse import parse_duration
 
-from vinta_state_machines.batches import SUCCESS, count_child, open_batch, uncount_child
-from vinta_state_machines.enums import HookEvent, HookTiming
+from vinta_state_machines.batches import (
+    SUCCESS,
+    abandon,
+    count_child,
+    live_batch_for,
+    open_batch,
+    uncount_child,
+)
+from vinta_state_machines.enums import BatchFailureReason, HookEvent, HookTiming
 from vinta_state_machines.side_effects import register_side_effect
 
 if TYPE_CHECKING:
@@ -35,8 +46,14 @@ if TYPE_CHECKING:
 
 REPORT_HANDLER = "state_machines.report_to_batch"
 OPEN_HANDLER = "state_machines.open_batch"
+ABANDON_HANDLER = "state_machines.abandon_batch"
 
-__all__ = ["OPEN_HANDLER", "REPORT_HANDLER", "wire_batch_reporting"]
+__all__ = [
+    "ABANDON_HANDLER",
+    "OPEN_HANDLER",
+    "REPORT_HANDLER",
+    "wire_batch_reporting",
+]
 
 
 @register_side_effect(
@@ -149,3 +166,37 @@ def wire_batch_reporting(
             )
             created.append(hook)
     return created
+
+
+@register_side_effect(
+    ABANDON_HANDLER,
+    name="Abandon the fan-out batch",
+    description="Stop a record's batch when it leaves the state it was waiting in.",
+    default_params={"cancel_children": False, "child_cancel_action": ""},
+)
+def abandon_batch_effect(context: SideEffectContext) -> None:
+    """Give up on the batch, and optionally tell the children to stop.
+
+    Two separate things, and only the second is a choice.
+
+    Abandoning is not optional.  If the batch stayed open the children would keep
+    reporting, the last one would claim the join, and the join would fire at a record
+    that has already moved somewhere with no such edge.
+
+    Whether the children are *told to stop* is the caller's decision, per cancellation,
+    which is why it is read from ``metadata`` with ``params`` as the default: one is a
+    fact about this cancellation, the other is what the graph usually wants.
+    """
+    batch = live_batch_for(context.instance, context.field_name)
+    if batch is None:
+        return
+
+    wanted = context.metadata.get("cancel_children", context.params.get("cancel_children", False))
+    action = context.params.get("child_cancel_action") or None
+
+    abandon(
+        batch,
+        reason=context.params.get("reason") or BatchFailureReason.CANCELLED,
+        detail=context.metadata.get("comment", "") or context.params.get("detail", ""),
+        child_cancel_action=action if wanted else None,
+    )
