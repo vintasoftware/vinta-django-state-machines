@@ -93,6 +93,7 @@ def validate_version(
     _check_guards(version, report)
     if check_handlers:
         _check_handlers(version, report)
+    _check_report_pairs(version, graph, report)
     _check_reachability(graph, report)
     return report
 
@@ -533,3 +534,45 @@ def _match_transition(
 
 def _source_key(edge: StateMachineTransition) -> str | None:
     return edge.from_state.status.key if edge.from_state is not None else None
+
+
+def _check_report_pairs(
+    version: StateMachineVersion, graph: VersionGraph, report: ValidationReport
+) -> None:
+    """A state that counts toward a batch has to be able to un-count too.
+
+    An ``enter_state`` report binding says "count this child when it arrives here".  On
+    a state the record can leave, that is only half an answer: without the matching
+    ``leave_state`` binding a reopened child stays counted, the batch reads complete
+    while a child is unfinished, and the parent moves on work that is no longer done.
+
+    This is an error rather than a warning, and the reason it can be is the exemption
+    below.  On a state flagged terminal the engine refuses the move, so the missing
+    binding could never have fired -- there is no deliberate one-way wiring left for an
+    error to get in the way of.
+    """
+    from vinta_state_machines.batch_effects import REPORT_HANDLER
+
+    bindings: dict[int, set[str]] = {}
+    for hook in version.hooks.filter(handler_key=REPORT_HANDLER, is_active=True):
+        if hook.state_id is not None:
+            bindings.setdefault(hook.state_id, set()).add(hook.event)
+
+    for state in version.states.select_related("status"):
+        events = bindings.get(state.pk)
+        if not events:
+            continue
+        if state.is_terminal:
+            if HookEvent.LEAVE_STATE in events:
+                report.warnings.append(
+                    f"{state.status.key} is terminal but has a leave_state report hook, "
+                    "which can never fire: the engine refuses to leave a terminal state."
+                )
+            continue
+        if HookEvent.ENTER_STATE in events and HookEvent.LEAVE_STATE not in events:
+            report.errors.append(
+                f"{state.status.key} counts toward a batch on enter but never un-counts "
+                "on leave, and it is not terminal, so a record can come back out of it "
+                "while its batch is still open. Wire the pair with wire_batch_reporting, "
+                "or mark the state terminal."
+            )

@@ -245,3 +245,11 @@ def waiting_run(run_version):
     record = ImportRun.objects.create(label="nightly")
     record.transition("import_run.start")
     return record
+
+
+@pytest.fixture
+def row_draft(db) -> StateMachineVersion:
+    """The child machine as an unpublished draft, for validation tests."""
+    import copy
+
+    return define_machine(copy.deepcopy(IMPORT_ROW_DEFINITION))
