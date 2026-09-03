@@ -465,6 +465,10 @@ BUNDLE_JS = (
 STRING_GROUPS = frozenset(
     {
         "toolbar",
+        # 0.9.0: the decision card, the waiting band, and the advisory stripes.
+        "decision",
+        "waiting",
+        "issue",
         "canvas",
         "kind",
         "card",
@@ -589,3 +593,17 @@ def test_every_string_the_glue_names_exists_in_the_component():
     assert len(keys) > 100, "the table lost most of itself"
     unknown = {key for key in keys if key not in bundle}
     assert not unknown, f"not in the vendored component: {sorted(unknown)}"
+
+
+def test_the_canvas_says_where_a_fan_out_link_goes(as_staff, risk_machine):
+    """The canvas draws one machine; a fan-out crosses into another.
+
+    The component only announces where the user wants to be, so without this the
+    FANS OUT TO link in a waiting state's band has nowhere to take them.
+    """
+    response = as_staff.get(
+        reverse("admin:state_machines_statemachine_change", args=[risk_machine.pk])
+    )
+
+    body = response.content.decode()
+    assert 'data-machines-url="/admin/state_machines/statemachine/"' in body

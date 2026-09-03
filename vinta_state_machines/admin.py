@@ -210,6 +210,10 @@ class EditorCanvasMixin(admin.ModelAdmin):
             "side_effects_url": self.editor_url("side_effects"),
             "actions_url": self.editor_url("actions"),
             "guard_url": self.editor_url("guard"),
+            # Where a fan-out link goes. The canvas draws one machine and a fan-out
+            # crosses into another, so the component only says where the user wants
+            # to be; this is the admin answering.
+            "machines_url": reverse("admin:state_machines_statemachine_changelist"),
             # Live mode: the graph is loaded and saved on its own endpoint, beside
             # the fields. Form mode: it rides along in ``field`` and is applied when
             # the row it belongs to has been created.

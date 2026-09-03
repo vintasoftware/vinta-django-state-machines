@@ -250,3 +250,83 @@ def test_a_state_that_stops_waiting_stops_being_checked(run_draft):
 def test_the_hook_params_route_is_still_available(waiting_run):
     """Declaring on the state is the new way, not the only way. Nothing regressed."""
     assert StateMachineHook.objects.count() == 0
+
+
+# ------------------------------------------------------- the half-configured pair
+
+
+def _report_hook(version, status_key, event, outcome="success"):
+    return StateMachineHook.objects.create(
+        state_machine_version=version,
+        handler_key=REPORT_HANDLER,
+        timing="after",
+        event=event,
+        state=version.states.get(status__key=status_key),
+        params={"outcome": outcome},
+    )
+
+
+def test_a_whole_pair_is_not_flagged_as_partial(row_draft):
+    wire_batch_reporting(row_draft, {"processed": "success"})
+
+    data = state_in(to_editor_machine(row_draft), "processed")["data"]
+
+    assert data["counts_as"] == "success"
+    assert "counts_as_partial" not in data
+
+
+def test_an_enter_only_pair_names_the_half_it_has(row_draft):
+    """The editor never sees a hook row, so it cannot work this out for itself.
+
+    Without the key a pair missing its leave half draws as though it were whole, and
+    the canvas cannot mark it broken while the person who broke it is still looking.
+    """
+    _report_hook(row_draft, "processed", HookEvent.ENTER_STATE)
+
+    data = state_in(to_editor_machine(row_draft), "processed")["data"]
+
+    assert data["counts_as"] == "success"
+    assert data["counts_as_partial"] == "enter"
+
+
+def test_a_leave_only_pair_is_reported_rather_than_hidden(row_draft):
+    """Broken everywhere. Reading only the enter list would have shown nothing at all."""
+    _report_hook(row_draft, "processed", HookEvent.LEAVE_STATE, outcome="failure")
+
+    data = state_in(to_editor_machine(row_draft), "processed")["data"]
+
+    assert data["counts_as"] == "failure"
+    assert data["counts_as_partial"] == "leave"
+
+
+def test_a_terminal_state_is_enter_only_and_says_so(row_draft):
+    """Right rather than broken, and the editor is the one that knows the difference."""
+    wire_batch_reporting(row_draft, {"rejected": "failure"})
+
+    data = state_in(to_editor_machine(row_draft), "rejected")["data"]
+
+    assert data["counts_as"] == "failure"
+    assert data["counts_as_partial"] == "enter"
+
+
+def test_a_state_that_reports_nothing_carries_neither_key(row_draft):
+    data = state_in(to_editor_machine(row_draft), "queued")["data"]
+
+    assert "counts_as" not in data
+    assert "counts_as_partial" not in data
+
+
+def test_the_partial_key_does_not_survive_a_round_trip_as_a_pair(row_draft):
+    """Applying reads counts_as; the partial half is a report, not an instruction."""
+    _report_hook(row_draft, "processed", HookEvent.ENTER_STATE)
+    document = to_editor_machine(row_draft)
+
+    apply_editor_machine(row_draft, document)
+
+    events = set(
+        row_draft.hooks.filter(
+            handler_key=REPORT_HANDLER, state__status__key="processed"
+        ).values_list("event", flat=True)
+    )
+    # Reopenable, so applying completes the pair rather than preserving the break.
+    assert events == {HookEvent.ENTER_STATE, HookEvent.LEAVE_STATE}

@@ -250,6 +250,116 @@ export const editorStrings = () => ({
     modeForm: gettext('Form'),
     modeJson: gettext('JSON'),
   },
+  // A decision card: several edges leaving one state under one action, which the
+  // engine resolves by trying each in turn. `else` and `unreachable` are left as the
+  // component's own words on purpose -- they are the vocabulary of the thing, and a
+  // translation that renames them stops matching what the guards read like.
+  decision: {
+    outcomes: ({ count }) =>
+      fill(ngettext('%(count)s outcome', '%(count)s outcomes', count), { count }, true),
+    label: ({ action, count }) =>
+      fill(
+        ngettext(
+          '%(action)s: %(count)s outcome, tried in order.',
+          '%(action)s: %(count)s outcomes, tried in order.',
+          count,
+        ),
+        { action, count },
+        true,
+      ),
+    fallbackTitle: gettext('No guard — runs when none of the rows above matched'),
+    orderTitle: ({ index, total }) =>
+      fill(gettext('Tried %(index)s of %(total)s'), { index, total }),
+    dead: gettext('unreachable'),
+    deadTitle: gettext(
+      'Never reached: a row above has no guard, so it always matches first',
+    ),
+    targetTitle: ({ name }) => fill(gettext('Goes to %(name)s'), { name }),
+    rowLabel: ({ outcome, target, index, total, expanded }) =>
+      fill(
+        expanded
+          ? gettext('Hide outcome %(index)s of %(total)s: %(outcome)s %(target)s')
+          : gettext('Edit outcome %(index)s of %(total)s: %(outcome)s %(target)s'),
+        { outcome, target, index, total },
+      ),
+    reorderLabel: ({ outcome, index, total }) =>
+      fill(
+        gettext(
+          'Reorder %(outcome)s. Position %(index)s of %(total)s. ' +
+            'Use Alt with arrow keys to move.',
+        ),
+        { outcome, index, total },
+      ),
+    reorderTitle: gettext('Drag to reorder, or press Alt + Arrow Up/Down'),
+    fieldsLabel: ({ name }) => fill(gettext('Fields of “%(name)s”'), { name }),
+    fieldName: gettext('Name'),
+  },
+
+  // The band on a state that fans work out, and the one line a child state carries
+  // to say it counts towards its parent's batch.
+  waiting: {
+    role: gettext('Waiting'),
+    mark: ({ name }) =>
+      fill(gettext('Mark “%(name)s” as a state that waits for a batch'), { name }),
+    unmark: ({ name }) =>
+      fill(gettext('Unmark “%(name)s” as a state that waits for a batch'), { name }),
+    bandLabel: ({ name }) => fill(gettext('The batch “%(name)s” waits for'), { name }),
+    fansOut: gettext('Fans out to'),
+    fansOutLink: ({ machine, name }) =>
+      fill(gettext('Open the machine “%(machine)s” that “%(name)s” fans out to'), {
+        machine,
+        name,
+      }),
+    fansOutTitle: ({ machine }) => fill(gettext('Open %(machine)s'), { machine }),
+    stubLabel: ({ name, machine }) =>
+      fill(gettext('“%(name)s” starts records governed by %(machine)s'), { name, machine }),
+    joinsWith: gettext('Joins with'),
+    timeout: gettext('Timeout'),
+    countsAs: gettext('Counts as'),
+    outcome: {
+      success: gettext('✓ success'),
+      failure: gettext('✗ failure'),
+    },
+    pairTitle: gettext('Reported on entering, and taken back on leaving'),
+    enterOnly: ({ outcome }) => fill(gettext('%(outcome)s · on enter only'), { outcome }),
+    enterOnlyTitle: gettext(
+      'A final state can never be left, so nothing takes the report back — ' +
+        'the leave half is dropped.',
+    ),
+    broken: ({ outcome }) => fill(gettext('%(outcome)s · half configured'), { outcome }),
+    brokenError: ({ half }) =>
+      fill(
+        gettext(
+          'Only the %(half)s half of this report is here. ' +
+            'The pair has to be whole on a state that can be left.',
+        ),
+        { half },
+      ),
+    half: {
+      enter: gettext('enter'),
+      leave: gettext('leave'),
+    },
+    unset: gettext('not set'),
+    rowLabel: ({ field, value, name }) =>
+      fill(gettext('%(field)s: %(value)s. Edit the attributes of “%(name)s”.'), {
+        field,
+        value,
+        name,
+      }),
+    section: gettext('Waiting for a batch'),
+  },
+
+  // The advisory stripes. They say where a problem is while the person who caused it
+  // is still looking at the card; the backend is what actually refuses to publish.
+  issue: {
+    label: gettext('Problems with this card'),
+    noFallback: gettext('No fallback — if every guard fails the record is stuck here.'),
+    noJoinEdge: gettext('Nothing leaves this state when the work finishes.'),
+    terminalHasExit: gettext(
+      'Terminal states cannot be left, so these edges never fire.',
+    ),
+  },
+
   properties: {
     title: ({ name }) => fill(gettext('Properties · %(name)s'), { name }),
     stateDescription: ({ name }) => fill(gettext('Attributes of the state “%(name)s”.'), { name }),

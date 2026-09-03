@@ -126,12 +126,24 @@ def _visible(hooks: list[StateMachineHook]) -> list[StateMachineHook]:
     return [hook for hook in hooks if hook.handler_key != REPORT_HANDLER]
 
 
-def _state_data(state: StateMachineState, entered: list[StateMachineHook]) -> dict[str, Any]:
+def _state_data(
+    state: StateMachineState,
+    entered: list[StateMachineHook],
+    left: list[StateMachineHook],
+) -> dict[str, Any]:
     """The `data` bag: what a state carries beyond position, colour and name.
 
     ``counts_as`` is derived rather than stored, because the outcome lives on the hook
     row that declares it.  Handing the editor a value instead of a handler key is what
     keeps the canvas from having to match on ``"state_machines.report_to_batch"``.
+
+    ``counts_as_partial`` says which half arrived on its own, and it is why both lists
+    are read rather than just the one.  The editor cannot work this out for itself --
+    it never sees a hook row -- so without it a pair missing its leave half renders as
+    though it were whole, and a leave half on its own does not render at all.  Naming
+    the half is what lets the canvas mark it broken while the person who broke it is
+    still looking at the card, rather than leaving it to ``validate_version`` at
+    publish time.
     """
     from vinta_state_machines.batch_effects import REPORT_HANDLER
 
@@ -141,10 +153,22 @@ def _state_data(state: StateMachineState, entered: list[StateMachineHook]) -> di
         data["join_action"] = state.join_action.key if state.join_action is not None else ""
         data["child_machine"] = state.child_machine
         data["timeout"] = duration_iso_string(state.batch_timeout) if state.batch_timeout else ""
-    for hook in entered:
-        if hook.handler_key == REPORT_HANDLER:
-            data["counts_as"] = hook.params.get("outcome", "success")
-            break
+
+    on_enter = next((h for h in entered if h.handler_key == REPORT_HANDLER), None)
+    on_leave = next((h for h in left if h.handler_key == REPORT_HANDLER), None)
+    if on_enter is None and on_leave is None:
+        return data
+
+    declared = on_enter or on_leave
+    assert declared is not None
+    data["counts_as"] = declared.params.get("outcome", "success")
+    if on_leave is None:
+        # Right on a terminal state, which can never be left, and broken anywhere
+        # else. The editor knows which of those this state is; we only say what we
+        # found.
+        data["counts_as_partial"] = "enter"
+    elif on_enter is None:
+        data["counts_as_partial"] = "leave"
     return data
 
 
@@ -185,7 +209,7 @@ def to_editor_machine(version: StateMachineVersion) -> dict[str, Any]:
                 # showed both chips would invite somebody to delete half of it.
                 "onEnter": _effects_payload(_visible(entered.get(state.pk, [])), names),
                 "onLeave": _effects_payload(_visible(left.get(state.pk, [])), names),
-                "data": _state_data(state, entered.get(state.pk, [])),
+                "data": _state_data(state, entered.get(state.pk, []), left.get(state.pk, [])),
             }
             for state in states
         ],
