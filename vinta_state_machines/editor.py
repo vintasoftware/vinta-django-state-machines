@@ -148,11 +148,17 @@ def _state_data(
     from vinta_state_machines.batch_effects import REPORT_HANDLER
 
     data: dict[str, Any] = {}
+    # Each key stands on its own, the way the component writes them: an unset value is
+    # an absent key rather than a blank one, and the three settings outlive the toggle
+    # so that turning a wait off and on again does not cost anybody their join action.
     if state.is_waiting:
         data["is_waiting"] = True
-        data["join_action"] = state.join_action.key if state.join_action is not None else ""
+    if state.join_action is not None:
+        data["join_action"] = state.join_action.key
+    if state.child_machine:
         data["child_machine"] = state.child_machine
-        data["timeout"] = duration_iso_string(state.batch_timeout) if state.batch_timeout else ""
+    if state.batch_timeout:
+        data["timeout"] = duration_iso_string(state.batch_timeout)
 
     on_enter = next((h for h in entered if h.handler_key == REPORT_HANDLER), None)
     on_leave = next((h for h in left if h.handler_key == REPORT_HANDLER), None)
@@ -577,6 +583,10 @@ def _apply_states(
     return result
 
 
+WAITING_KEYS = ("is_waiting", "join_action", "child_machine", "timeout")
+"""The keys the component owns inside ``state.data``. It touches nothing else."""
+
+
 def _apply_state_data(state: StateMachineState, data: Any, errors: list[str]) -> None:
     """Read the fan-out declaration off the document's `data` bag.
 
@@ -585,9 +595,16 @@ def _apply_state_data(state: StateMachineState, data: Any, errors: list[str]) ->
     """
     if not isinstance(data, dict):
         return
-    if "is_waiting" not in data:
+    if not any(key in data for key in WAITING_KEYS):
+        # The document says nothing about fanning out, so neither do we. A client
+        # built before any of this existed round trips unchanged.
         return
 
+    # Turning the wait off *deletes* `is_waiting` rather than writing false, and keeps
+    # the other three -- so absence has to be read as "off" once any of its siblings is
+    # here, or the toggle would never persist. A state whose settings were all empty
+    # leaves nothing behind to read, which is why the editor is also asked to write the
+    # flag out explicitly.
     state.is_waiting = bool(data.get("is_waiting"))
     state.child_machine = str(data.get("child_machine") or "")
 

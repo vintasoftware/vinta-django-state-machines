@@ -330,3 +330,75 @@ def test_the_partial_key_does_not_survive_a_round_trip_as_a_pair(row_draft):
     )
     # Reopenable, so applying completes the pair rather than preserving the break.
     assert events == {HookEvent.ENTER_STATE, HookEvent.LEAVE_STATE}
+
+
+# ------------------------------------------------- turning the fan-out off again
+
+
+def toggled_off(document, status_key):
+    """What ``setWaiting`` leaves behind: the flag deleted, the settings kept.
+
+    Not a guess. ``withKey(data, 'is_waiting', undefined)`` deletes rather than writes
+    false, and the other three keys are written back verbatim.
+    """
+    data = state_in(document, status_key)["data"]
+    data.pop("is_waiting", None)
+    return document
+
+
+def test_toggling_the_wait_off_in_the_canvas_persists(run_draft):
+    """The flag is deleted rather than set false, so absence has to mean off."""
+    mark_waiting(run_draft, child_machine="import_row.status")
+    document = to_editor_machine(run_draft)
+
+    apply_editor_machine(run_draft, toggled_off(document, "processing"))
+
+    assert run_draft.states.get(status__key="processing").is_waiting is False
+
+
+def test_toggling_the_wait_off_keeps_the_join_action(run_draft):
+    """A toggle pressed by mistake should not cost anybody their setup."""
+    mark_waiting(run_draft, child_machine="import_row.status")
+    document = to_editor_machine(run_draft)
+
+    apply_editor_machine(run_draft, toggled_off(document, "processing"))
+
+    state = run_draft.states.get(status__key="processing")
+    assert state.join_action.key == "import_run.finish"
+    assert state.child_machine == "import_row.status"
+
+
+def test_the_kept_settings_come_back_on_the_next_load(run_draft):
+    """Kept in the database but not sent is the same as lost, one reload later."""
+    mark_waiting(run_draft, child_machine="import_row.status")
+    apply_editor_machine(run_draft, toggled_off(to_editor_machine(run_draft), "processing"))
+
+    data = state_in(to_editor_machine(run_draft), "processing")["data"]
+
+    assert "is_waiting" not in data
+    assert data["join_action"] == "import_run.finish"
+    assert data["child_machine"] == "import_row.status"
+
+
+def test_turning_it_back_on_needs_nothing_re_entered(run_draft):
+    mark_waiting(run_draft, child_machine="import_row.status")
+    apply_editor_machine(run_draft, toggled_off(to_editor_machine(run_draft), "processing"))
+
+    document = to_editor_machine(run_draft)
+    state_in(document, "processing")["data"]["is_waiting"] = True
+    apply_editor_machine(run_draft, document)
+
+    state = run_draft.states.get(status__key="processing")
+    assert state.is_waiting is True
+    assert state.join_action.key == "import_run.finish"
+
+
+def test_an_unset_value_is_an_absent_key_rather_than_a_blank_one(run_draft):
+    """Which is how the component writes them, so a round trip is byte for byte."""
+    state = run_draft.states.get(status__key="processing")
+    state.is_waiting = True
+    state.save()
+
+    data = state_in(to_editor_machine(run_draft), "processing")["data"]
+
+    assert data == {"is_waiting": True}

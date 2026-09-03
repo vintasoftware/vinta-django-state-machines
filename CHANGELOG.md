@@ -31,6 +31,17 @@ All notable changes to this project are documented here. The format follows
   action. The batch would complete, fire, find nothing, and leave the record waiting for
   good — a failure that only surfaces once the work finishes.
 
+### Fixed
+
+- Turning a fan-out **off** on the canvas now persists. The component deletes `is_waiting`
+  rather than writing it false, and keeps the other three keys so a toggle pressed by
+  mistake costs nobody their join action — so absence of the flag has to be read as *off*
+  once any of its siblings is present, rather than as a document with nothing to say.
+  A state whose settings were all empty leaves nothing behind to read either way, which
+  is why the editor is separately asked to write the flag out explicitly.
+- The three settings survive the toggle in the payload as well as in the database. Kept
+  in a column but not sent back is the same as lost, one reload later.
+
 ### Changed
 
 - The bundled `vinta-state-machine-editor` moves from 0.8.0 to **0.9.0**: edges that share a
