@@ -31,7 +31,7 @@ from django.db.models import F
 from django.utils import timezone
 
 from vinta_state_machines.conf import batch_model_path, get_setting
-from vinta_state_machines.enums import BatchFailureReason, BatchLifecycle
+from vinta_state_machines.enums import BatchFailureReason, BatchLifecycle, HookEvent
 from vinta_state_machines.exceptions import BatchDepthExceeded, StateMachineError
 from vinta_state_machines.fields import (
     batch_member_relations,
@@ -63,6 +63,8 @@ __all__ = [
     "join_metadata",
     "live_batch_for",
     "open_batch",
+    "outcomes_of",
+    "recount",
     "report",
     "report_failure",
     "report_success",
@@ -506,3 +508,69 @@ def _by_status(batch: StatusBatch) -> dict[str, int]:
             keys.update(get_graph(version_pk).states)
 
     return {key: counts.get(key, 0) for key in keys | set(counts)}
+
+
+def outcomes_of(version_pk: int) -> dict[str, int]:
+    """``{status_key: 1 if success else 0}`` for one child version's finished states.
+
+    Read from the version's own report bindings, which is where the outcome was
+    declared.  It is the only place it exists: a stamp records *that* a child was
+    counted, never how it went.
+    """
+    from vinta_state_machines.batch_effects import REPORT_HANDLER
+    from vinta_state_machines.models import StateMachineHook
+
+    hooks = StateMachineHook.objects.filter(
+        state_machine_version_id=version_pk,
+        handler_key=REPORT_HANDLER,
+        event=HookEvent.ENTER_STATE,
+        is_active=True,
+        state__isnull=False,
+    ).select_related("state__status")
+    return {
+        hook.state.status.key: int(hook.params.get("outcome", SUCCESS) == SUCCESS)
+        for hook in hooks
+        if hook.state is not None
+    }
+
+
+def recount(batch: StatusBatch) -> tuple[int, int]:
+    """Rebuild ``(finished, succeeded)`` from the stamps and the opaque reports.
+
+    The authority the sweeper repairs a drifted counter against.  Both numbers are
+    rebuilt together on purpose: repairing only ``finished`` would leave a batch reading
+    as though a child had failed, and route the join down the wrong edge.
+    """
+    finished = 0
+    succeeded = 0
+    seen: dict[int, dict[str, int]] = {}
+
+    for relation in batch_member_relations(type(batch)):
+        model = relation.related_model
+        stamp = get_batch_field_config(model, relation.field.name).reported_at_field
+        rows = model._default_manager.filter(
+            **{relation.field.name: batch.pk, f"{stamp}__isnull": False}
+        )
+        declared = status_fields_of(model)
+        if not declared:
+            # No governed status, so nothing to read an outcome from. It still counts
+            # toward completeness; it just cannot count toward success.
+            finished += rows.count()
+            continue
+        status_field = declared[0]
+        config = get_status_field_config(model, status_field.name)
+        version_column = f"{config.version_field}_id"
+        grouped = rows.values(status_field.name, version_column).annotate(n=models.Count("pk"))
+        for row in grouped:
+            finished += row["n"]
+            version_pk = row[version_column]
+            if version_pk is None:
+                continue
+            if version_pk not in seen:
+                seen[version_pk] = outcomes_of(version_pk)
+            succeeded += row["n"] * seen[version_pk].get(row[status_field.name], 0)
+
+    reports = _report_model().objects.filter(batch_id=batch.pk)
+    finished += reports.count()
+    succeeded += reports.filter(outcome=SUCCESS).count()
+    return finished, succeeded
