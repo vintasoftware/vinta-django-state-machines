@@ -32,7 +32,7 @@ class StateMachineVersionQuerySet(models.QuerySet["StateMachineVersion"]):
     def with_graph(self) -> StateMachineVersionQuerySet:
         """Prefetch everything :func:`~vinta_state_machines.graph.build_graph` reads."""
         return self.select_related("state_machine__scope").prefetch_related(
-            "states__status", "transitions__action_type", "hooks"
+            "states__status", "states__join_action", "transitions__action_type", "hooks"
         )
 
 

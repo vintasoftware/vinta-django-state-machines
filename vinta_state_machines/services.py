@@ -94,6 +94,7 @@ def validate_version(
     if check_handlers:
         _check_handlers(version, report)
     _check_report_pairs(version, graph, report)
+    _check_waiting_states(graph, report)
     _check_reachability(graph, report)
     return report
 
@@ -575,4 +576,28 @@ def _check_report_pairs(
                 "on leave, and it is not terminal, so a record can come back out of it "
                 "while its batch is still open. Wire the pair with wire_batch_reporting, "
                 "or mark the state terminal."
+            )
+
+
+def _check_waiting_states(graph: VersionGraph, report: ValidationReport) -> None:
+    """A state that fans work out has to have somewhere to go when the work is done.
+
+    The join is an ordinary transition, so if the version declares no edge leaving this
+    state under its join action, the batch completes, fires, and finds nothing -- and
+    the record sits in the waiting state for good.  Cheap to catch here; expensive to
+    notice in production, because it only shows up once the work finishes.
+    """
+    for state in graph.waiting_states:
+        if not state.join_action:
+            report.errors.append(
+                f"{state.key} fans work out but names no join action, so nothing would "
+                "ever move a record on from it."
+            )
+            continue
+        if not graph.candidates(state.key, state.join_action):
+            available = ", ".join(graph.actions_from(state.key)) or "<none>"
+            report.errors.append(
+                f"{state.key} fans work out under {state.join_action!r}, but no "
+                f"transition leaves it under that action. Available from here: "
+                f"{available}."
             )

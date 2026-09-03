@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING, Any
 
 from django.db import transaction
 from django.db.models import Count, ProtectedError
+from django.utils.dateparse import parse_duration
+from django.utils.duration import duration_iso_string
 from django.utils.text import slugify
 
 from vinta_state_machines.enums import HookEvent, HookTiming, Lifecycle, StateColor
@@ -117,11 +119,40 @@ def _effects_payload(
     return payload
 
 
+def _visible(hooks: list[StateMachineHook]) -> list[StateMachineHook]:
+    """Hooks the canvas draws as chips, which is every one it did not generate."""
+    from vinta_state_machines.batch_effects import REPORT_HANDLER
+
+    return [hook for hook in hooks if hook.handler_key != REPORT_HANDLER]
+
+
+def _state_data(state: StateMachineState, entered: list[StateMachineHook]) -> dict[str, Any]:
+    """The `data` bag: what a state carries beyond position, colour and name.
+
+    ``counts_as`` is derived rather than stored, because the outcome lives on the hook
+    row that declares it.  Handing the editor a value instead of a handler key is what
+    keeps the canvas from having to match on ``"state_machines.report_to_batch"``.
+    """
+    from vinta_state_machines.batch_effects import REPORT_HANDLER
+
+    data: dict[str, Any] = {}
+    if state.is_waiting:
+        data["is_waiting"] = True
+        data["join_action"] = state.join_action.key if state.join_action is not None else ""
+        data["child_machine"] = state.child_machine
+        data["timeout"] = duration_iso_string(state.batch_timeout) if state.batch_timeout else ""
+    for hook in entered:
+        if hook.handler_key == REPORT_HANDLER:
+            data["counts_as"] = hook.params.get("outcome", "success")
+            break
+    return data
+
+
 def to_editor_machine(version: StateMachineVersion) -> dict[str, Any]:
     """Serialize one version as the ``StateMachine`` document the editor consumes."""
     names = {info.key: info.name for info in side_effect_catalog()}
 
-    states = list(version.states.select_related("status").order_by("order", "pk"))
+    states = list(version.states.select_related("status", "join_action").order_by("order", "pk"))
     transitions = list(
         version.transitions.select_related(
             "action_type", "from_state__status", "to_state__status"
@@ -149,9 +180,12 @@ def to_editor_machine(version: StateMachineVersion) -> dict[str, Any]:
                 "position": {"x": state.x, "y": state.y},
                 "color": state.color,
                 "description": state.status.description,
-                "onEnter": _effects_payload(entered.get(state.pk, []), names),
-                "onLeave": _effects_payload(left.get(state.pk, []), names),
-                "data": {},
+                # The report pair is hidden from the lanes and surfaced as one
+                # value: it is one concept stored as two rows, and an editor that
+                # showed both chips would invite somebody to delete half of it.
+                "onEnter": _effects_payload(_visible(entered.get(state.pk, [])), names),
+                "onLeave": _effects_payload(_visible(left.get(state.pk, [])), names),
+                "data": _state_data(state, entered.get(state.pk, [])),
             }
             for state in states
         ],
@@ -447,6 +481,7 @@ def apply_editor_machine(version: StateMachineVersion, payload: Any) -> StateMac
         raise EditorPayloadError(errors)
 
     _apply_hooks(version, state_specs, edge_specs, states, transitions, errors)
+    _apply_counts_as(state_specs, states)
     if errors:
         raise EditorPayloadError(errors)
 
@@ -506,6 +541,7 @@ def _apply_states(
         state.order = order
         state.x = _as_int(position.get("x"))
         state.y = _as_int(position.get("y"))
+        _apply_state_data(state, spec.get("data"), errors)
         state.save()
 
         kept.add(state.pk)
@@ -515,6 +551,41 @@ def _apply_states(
     if stale:
         StateMachineState.objects.filter(pk__in=stale).delete()
     return result
+
+
+def _apply_state_data(state: StateMachineState, data: Any, errors: list[str]) -> None:
+    """Read the fan-out declaration off the document's `data` bag.
+
+    A document that says nothing leaves the state as it was, so a client built before
+    any of this existed round trips unchanged.
+    """
+    if not isinstance(data, dict):
+        return
+    if "is_waiting" not in data:
+        return
+
+    state.is_waiting = bool(data.get("is_waiting"))
+    state.child_machine = str(data.get("child_machine") or "")
+
+    raw_timeout = data.get("timeout") or ""
+    state.batch_timeout = parse_duration(raw_timeout) if raw_timeout else None
+    if raw_timeout and state.batch_timeout is None:
+        errors.append(f"State {state.status.key!r} has an unreadable timeout {raw_timeout!r}.")
+
+    action_key = str(data.get("join_action") or "")
+    if not action_key:
+        state.join_action = None
+        if state.is_waiting:
+            errors.append(
+                f"State {state.status.key!r} fans work out but names no join action, "
+                "so nothing would ever move the record on."
+            )
+        return
+    action = ActionType.objects.filter(key=action_key).first()
+    if action is None:
+        errors.append(f"State {state.status.key!r} names the unknown action {action_key!r}.")
+        return
+    state.join_action = action
 
 
 def _apply_transitions(
@@ -608,10 +679,16 @@ def _apply_hooks(
     """Rebuild the six ordered side-effect lists per element into hook rows.
 
     ``any_transition`` hooks are not drawn on the canvas, so they are neither read
-    from the document nor deleted for being absent from it.
+    from the document nor deleted for being absent from it.  Report bindings are left
+    out for the same reason: they are not chips, they are the state's ``counts_as``, and
+    :func:`_apply_counts_as` owns them.
     """
+    from vinta_state_machines.batch_effects import REPORT_HANDLER
+
     existing = {
-        hook.pk: hook for hook in version.hooks.all() if hook.event != HookEvent.ANY_TRANSITION
+        hook.pk: hook
+        for hook in version.hooks.all()
+        if hook.event != HookEvent.ANY_TRANSITION and hook.handler_key != REPORT_HANDLER
     }
     kept: set[int] = set()
 
@@ -664,6 +741,54 @@ def _apply_hooks(
     stale = [pk for pk in existing if pk not in kept]
     if stale:
         StateMachineHook.objects.filter(pk__in=stale).delete()
+
+
+def _apply_counts_as(
+    state_specs: list[dict[str, Any]], states: dict[str, StateMachineState]
+) -> None:
+    """Turn each state's ``counts_as`` back into the pair of report bindings.
+
+    The editor never sees a handler key.  It sends a value -- ``"success"``,
+    ``"failure"``, or nothing -- and this is where that becomes rows, which is what
+    keeps the canvas from having to know the name of a function in this package.
+
+    The ``leave_state`` half is written only where the state can actually be left. On a
+    terminal state the engine refuses the move, so that binding could never fire.
+    """
+    from vinta_state_machines.batch_effects import REPORT_HANDLER
+
+    for spec in state_specs:
+        state = states.get(str(spec.get("id")))
+        if state is None:
+            continue
+        data = spec.get("data")
+        outcome = data.get("counts_as") if isinstance(data, dict) else None
+
+        bindings = StateMachineHook.objects.filter(
+            state_machine_version=state.state_machine_version,
+            handler_key=REPORT_HANDLER,
+            state=state,
+        )
+        if not outcome:
+            bindings.delete()
+            continue
+
+        wanted = [HookEvent.ENTER_STATE]
+        if not state.is_terminal:
+            wanted.append(HookEvent.LEAVE_STATE)
+        bindings.exclude(event__in=wanted).delete()
+        for event in wanted:
+            StateMachineHook.objects.update_or_create(
+                state_machine_version=state.state_machine_version,
+                handler_key=REPORT_HANDLER,
+                event=event,
+                state=state,
+                defaults={
+                    "timing": HookTiming.AFTER,
+                    "on_commit": True,
+                    "params": {"outcome": outcome},
+                },
+            )
 
 
 def _as_int(value: Any) -> int:

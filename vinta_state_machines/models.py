@@ -633,6 +633,42 @@ class StateMachineState(TimeStampedModel):
         default=StateColor.NEUTRAL,
     )
     order = models.PositiveIntegerField(_("order"), default=0)
+
+    # --- fan-out. Declared on the state rather than left in hook params so the canvas
+    # can draw it and `validate_version` can refuse a waiting state with no way out.
+    is_waiting = models.BooleanField(
+        _("is waiting"),
+        default=False,
+        help_text=_("Entering this state fans work out, and the record waits for it."),
+    )
+    join_action = models.ForeignKey(
+        "state_machines.ActionType",
+        verbose_name=_("join action"),
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="+",
+        help_text=_(
+            "Fired on this record for every ending of the batch -- clean, partial, "
+            "total failure and timeout alike. Guards on the edges decide where it lands."
+        ),
+    )
+    child_machine = models.CharField(
+        _("child machine"),
+        max_length=150,
+        blank=True,
+        help_text=_(
+            "Key of the machine the children are governed by. Presentation only: it is "
+            "what the canvas links to, and nothing resolves it at runtime."
+        ),
+    )
+    batch_timeout = models.DurationField(
+        _("batch timeout"),
+        null=True,
+        blank=True,
+        help_text=_("How long the work may take before the batch gives up on it."),
+    )
+
     x = models.IntegerField(
         _("x"),
         default=0,

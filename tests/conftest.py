@@ -253,3 +253,11 @@ def row_draft(db) -> StateMachineVersion:
     import copy
 
     return define_machine(copy.deepcopy(IMPORT_ROW_DEFINITION))
+
+
+@pytest.fixture
+def run_draft(db) -> StateMachineVersion:
+    """The parent machine as an unpublished draft, for editor and validation tests."""
+    import copy
+
+    return define_machine(copy.deepcopy(IMPORT_RUN_DEFINITION))

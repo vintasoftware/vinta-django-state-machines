@@ -41,8 +41,11 @@ class StateSpec:
     is_terminal: bool
     color: str
     order: int
-    x: int
-    y: int
+    is_waiting: bool = False
+    join_action: str = ""
+    child_machine: str = ""
+    x: int = 0
+    y: int = 0
 
     @property
     def position(self) -> tuple[int, int]:
@@ -128,6 +131,11 @@ class VersionGraph:
 
     # ------------------------------------------------------------------ states
     @property
+    def waiting_states(self) -> tuple[StateSpec, ...]:
+        """States that fan work out. What the canvas badges and validation checks."""
+        return tuple(state for state in self.ordered_states if state.is_waiting)
+
+    @property
     def initial_states(self) -> tuple[StateSpec, ...]:
         return tuple(state for state in self.ordered_states if state.is_initial)
 
@@ -208,7 +216,9 @@ def build_graph(version: StateMachineVersion) -> VersionGraph:
     machine = version.state_machine
     states_by_pk: dict[int, StateSpec] = {}
     states: dict[str, StateSpec] = {}
-    for state in _related(version, "states", lambda: version.states.select_related("status")):
+    for state in _related(
+        version, "states", lambda: version.states.select_related("status", "join_action")
+    ):
         spec = _state_spec(state)
         states_by_pk[state.pk] = spec
         states[spec.key] = spec
@@ -316,6 +326,9 @@ def _state_spec(state: StateMachineState) -> StateSpec:
         is_terminal=state.is_terminal,
         color=state.color,
         order=state.order,
+        is_waiting=state.is_waiting,
+        join_action=state.join_action.key if state.join_action is not None else "",
+        child_machine=state.child_machine,
         x=state.x,
         y=state.y,
     )
