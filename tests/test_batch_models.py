@@ -185,7 +185,11 @@ def test_with_progress_orders_least_done_first(risk, risk_version):
     behind.save(update_fields=["lifecycle"])
     ahead = make_batch(risk, risk_version, total=10, finished=9)
 
-    ordered = list(StatusBatch.objects.with_progress().order_by("progress_ratio"))
+    # django-stubs resolves order_by against the model's own fields, and cannot see an
+    # alias annotate() added, so the name it is being ordered by looks made up.
+    ordered = list(
+        StatusBatch.objects.with_progress().order_by("progress_ratio")  # type: ignore[misc]
+    )
 
     assert [item.pk for item in ordered] == [behind.pk, ahead.pk]
     assert ordered[0].progress_ratio == pytest.approx(0.1)
