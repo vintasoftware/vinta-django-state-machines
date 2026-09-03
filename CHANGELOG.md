@@ -6,6 +6,58 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-03
+
+### Added
+
+- **Fan-out batches.** A state can start many child jobs, show how far along they are, and
+  move the record on by itself when they finish. `open_batch()` records what a record is
+  waiting for, `seal()` fixes the total, every child that finishes is counted against it,
+  and exactly one caller claims the batch and fires an ordinary `transition()` on the
+  parent — guarded, permissioned and written to the history like any other move.
+- **Nesting, which is not a separate feature.** Children are ordinary status-bearing
+  records, so a child that opens a batch of its own is a parent one level down. An import
+  fans out to files, a file fans out to rows, and every level runs the same two rules.
+  `MAX_BATCH_DEPTH` refuses a machine whose child machine is, transitively, itself.
+- `StatusBatch` (swappable through `STATE_MACHINES_BATCH_MODEL`) and `StatusBatchReport`.
+  At most one live batch per record per status field is a database constraint, which is
+  what makes `open_batch()` safe to call twice and lets the join be claimed with a single
+  conditional `UPDATE`.
+- `StatusBatchField()` and `BatchReportedAtField()`, declared as a pair on a child model the
+  way `status_key` and `status_machine_version` already are, with system checks for the
+  companion that is missing or cannot hold a null. **The stamp is what counts a child**, not
+  a call — so a redelivered task, or a record pushed into a finished state twice, counts
+  once. It is deliberately not derived from `StatusTransition` rows, because
+  `record_history=False` is a supported way to run a very noisy level.
+- Two side-effect handlers, so a fan-out is expressible entirely as graph data and the ETL
+  code never mentions batches: `state_machines.open_batch` on entering the waiting state, and
+  `state_machines.report_to_batch` on **both** events of every finished state — arriving
+  counts the child, leaving un-counts it. `wire_batch_reporting()` writes the rows, and writes
+  the leave half only where the state can actually be left.
+- `state_machines.abandon_batch` for cancelling. The batch is *always* abandoned; whether the
+  children are told to stop is a per-cancellation choice passed in `metadata`. A child whose
+  graph has no edge for the cancel action is left to run, and the cascade is dispatched rather
+  than run inline.
+- `python manage.py close_status_batches`, which repairs a counter that disagrees with the
+  stamps, claims a complete batch nobody claimed, re-dispatches a join whose worker never came
+  back, and times out a batch past its deadline. Repair runs first, so a count nobody's stamps
+  support cannot move a parent on work that never happened.
+- `progress_of()` and `batch_tree()`, returning plain JSON-serialisable dicts, plus a batch
+  admin with a progress column and the nested tree. The tree is a tree of *batches*, not of
+  children, so a run over a million rows still draws as a handful of nodes. The library ships
+  the read API and no refresh loop: how often anyone looks is the project's business.
+- `BATCH_DISPATCHER`, `MAX_BATCH_DEPTH` and `BATCH_JOIN_RETRY_AFTER` settings. The dispatcher
+  is where a project says what runs a join or a cancel cascade; without one they run in
+  `transaction.on_commit`, which keeps the library working out of the box and the test suite
+  synchronous. Every dispatch is deferred to commit whichever is configured, so a worker never
+  reads a batch row its own transaction has not written yet.
+- **Every ending fires one action.** A clean run, a partial failure, a total failure and a
+  timeout all fire the batch's `join_action`; guards on the edges decide where the record
+  lands, using the "several edges, one action, first guard wins" behaviour the engine already
+  had. `failure_reason` is a short code a guard compares against and `failure_detail` is the
+  human half.
+
+
 ### Added
 
 - **The canvas draws the fan-out.** A state that waits for a batch is declared on the graph —
@@ -22,11 +74,11 @@ All notable changes to this project are documented here. The format follows
   missing its leave half draws as though it were whole, and a leave half on its own does not
   draw at all. `validate_version` still refuses such a graph at publish time — this is what
   puts the same fact on the card while the person who caused it is still looking at it.
-- `data-machines-url` on the canvas, and a `state-machine-fan-out` listener in the glue. The
-  component announces that somebody asked to follow a fan-out and stops there, because a
-  canvas draws one machine and a fan-out crosses into another; this is the admin answering,
-  by searching the machine list for the child machine's key. It asks before leaving a graph
-  with unsaved changes.
+- `data-machines-url` on the canvas, and an `editor.fanOutHandler` in the glue. The component
+  announces that somebody asked to follow a fan-out and stops there, because a canvas draws
+  one machine and a fan-out crosses into another; this is the admin answering, by searching
+  the machine list for the child machine's key. It asks before leaving a graph with unsaved
+  changes.
 - `validate_version` refuses a waiting state whose version declares no edge under its join
   action. The batch would complete, fire, find nothing, and leave the record waiting for
   good — a failure that only surfaces once the work finishes.
@@ -360,7 +412,8 @@ package; if this is your first install, only **Added** applies.
   leaving the same state, so the two sort identically; `define_machine` still numbers
   across the version.
 
-[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.2.0...v0.3.0
