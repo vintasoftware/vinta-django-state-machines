@@ -213,24 +213,44 @@ class SideEffectContext:
 
 
 def run_hooks(
-    hooks: list[HookSpec], context_factory: Callable[[HookSpec], SideEffectContext]
+    hooks: list[HookSpec],
+    context_factory: Callable[[HookSpec], SideEffectContext],
+    *,
+    recorder: Any = None,
+    record: Any = None,
 ) -> None:
     """Execute ``hooks`` in order, building each handler's context lazily.
 
     ``on_commit`` hooks are deferred to the end of the surrounding transaction; every
     other hook runs inline so that a ``before`` handler can still veto the change.
+
+    ``recorder`` is a :class:`~vinta_state_machines.runs.RunRecorder`, which the engine
+    supplies and nothing else has to.  An inline handler is timed into its buffer and
+    written when the transition resolves; a deferred one records itself, since by the
+    time it runs the buffer has long been flushed.  Left ``None``, nothing is recorded
+    and the handlers run exactly as they always did.
     """
     for hook in hooks:
         handler = get_side_effect(hook.handler_key)
         context = context_factory(hook)
         if hook.on_commit and hook.timing == "after":
-            transaction.on_commit(_bind(handler, context))
-        else:
+            transaction.on_commit(_bind(handler, context, recorder, record))
+        elif recorder is None:
             handler(context)
+        else:
+            with recorder.measure(hook, context.timing, context.event):
+                handler(context)
 
 
-def _bind(handler: SideEffect, context: SideEffectContext) -> Callable[[], Any]:
+def _bind(
+    handler: SideEffect, context: SideEffectContext, recorder: Any, record: Any
+) -> Callable[[], Any]:
     def run() -> Any:
-        return handler(context)
+        if recorder is None:
+            return handler(context)
+        from vinta_state_machines.runs import record_deferred_run
+
+        with record_deferred_run(recorder, context.hook, context.timing, context.event, record):
+            return handler(context)
 
     return run

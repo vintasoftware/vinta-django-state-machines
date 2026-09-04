@@ -31,3 +31,8 @@ def scope_key_for_owner(instance: Any, config: Any) -> Any:
     """Same, but returning the portable key so the string branch gets covered too."""
     owner_id = getattr(instance, "owner_id", None)
     return None if owner_id is None else f"org.{owner_id}"
+
+
+def always_allow(actor: Any, permission: str, instance: Any) -> bool:
+    """A ``PERMISSION_CHECKER`` that says yes, for tests that need one at all."""
+    return True

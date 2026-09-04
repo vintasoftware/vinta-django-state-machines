@@ -134,10 +134,40 @@ DEFAULTS: dict[str, Any] = {
     # How long a batch may sit in ``joining`` before the sweeper assumes the worker
     # died and dispatches the join again.  A batch may override this per row.
     "BATCH_JOIN_RETRY_AFTER": timedelta(minutes=5),
+    # How much side-effect activity is written to ``SideEffectRun``: ``"none"``,
+    # ``"failures"`` or ``"all"``.  Timing every handler is free; storing a row per
+    # handler per transition is not, so the default keeps the ones that explain a
+    # failure and drops the rest.  One hook may override this through its
+    # ``record_runs`` column.
+    "RECORD_SIDE_EFFECT_RUNS": "failures",
+    # Copy the exception's *message* onto a failed run, not just its class.  Off by
+    # default: an exception string routinely quotes the value that broke it, and a
+    # run row is a second place that value would then live.
+    "CAPTURE_SIDE_EFFECT_ERROR_DETAIL": False,
+    # Cap on a captured error message, in characters.
+    "MAX_SIDE_EFFECT_ERROR_DETAIL": 500,
+    # Dotted path to ``sink(runs) -> None``, taking a list of unsaved ``SideEffectRun``
+    # instances.  ``None`` writes them with the ORM.  A project whose callers wrap
+    # ``transition()`` in a transaction of their own points this somewhere durable:
+    # a rollback out there takes the ORM-written rows with it.
+    "SIDE_EFFECT_RUN_SINK": None,
+    # Enforce each scope's ``ScopeCapabilityRule`` rows while authoring.  Turning this
+    # off leaves the rules in place and stops consulting them, which is the switch to
+    # reach for if a policy locks somebody out of their own editor.
+    "ENFORCE_CAPABILITY_POLICY": True,
+    # Permission that lets an actor wire up a key their scope's policy forbids.
+    # Superusers hold it implicitly, as they do every permission.
+    "CAPABILITY_BYPASS_PERMISSION": "state_machines.bypass_capability_policy",
 }
 
 _IMPORT_STRINGS = frozenset(
-    {"PERMISSION_CHECKER", "SCOPE_RESOLVER", "IDENTITY_RESOLVER", "BATCH_DISPATCHER"}
+    {
+        "PERMISSION_CHECKER",
+        "SCOPE_RESOLVER",
+        "IDENTITY_RESOLVER",
+        "BATCH_DISPATCHER",
+        "SIDE_EFFECT_RUN_SINK",
+    }
 )
 
 _cache: dict[str, Any] = {}

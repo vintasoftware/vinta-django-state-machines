@@ -50,5 +50,14 @@ def boom(context: Any) -> None:
     raise RuntimeError("boom")
 
 
+SINKED: list[Any] = []
+
+
+def collect_runs(runs: list[Any]) -> None:
+    """A ``SIDE_EFFECT_RUN_SINK`` that keeps the rows in memory instead of writing them."""
+    SINKED.extend(runs)
+
+
 def reset() -> None:
     CALLS.clear()
+    SINKED.clear()

@@ -6,6 +6,45 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Per-tenant capabilities.** `ScopeCapabilityRule` limits which registered side effects,
+  triggers (`ActionType` keys) and named guards a scope may wire up, as an allow list, a
+  deny list, or both, over exact keys or globs. A scope with no rules is unrestricted, so
+  nothing changes until you write one. Deny beats allow whatever the specificity, and the
+  **global scope's rules intersect** with a tenant's rather than being replaced by them —
+  deliberately not the fallback that machine resolution does, because a global machine is
+  a default a tenant may replace while a global rule is the installation speaking.
+- `state_machines.bypass_capability_policy`, the permission that lets staff wire a handler
+  into a tenant's machine that the tenant could not have wired itself. Routed through
+  `PERMISSION_CHECKER` when a project has set one; superusers hold it implicitly.
+- **Enforced where the wiring is written, not while a record moves.** The engine never
+  consults these rules: a published version is immutable and records pin it, so a policy
+  row that changed what a pinned version does would take that guarantee away. The editor's
+  catalogs are narrowed, the editor's save path and `define_machine` refuse, and
+  `publish_version` only *warns* — a rule that tightened after a draft was drawn must not
+  strand the draft. `check_scope_capabilities` finds the versions a new rule left behind.
+- A restricted scope can no longer mint an `ActionType` from the canvas. An unrestricted
+  one still can, as before; but using the vocabulary and extending it are different
+  privileges, and an allow list of `risk.*` is not a licence to create `risk.anything`.
+- `import_state_machine --ignore-policy`, for the operator who wrote the rules and is
+  deliberately seeding around them.
+- **`SideEffectRun`.** One row per execution of one handler: when it started, when it
+  finished, how long it took on a monotonic clock, and how it ended. Governed by
+  `RECORD_SIDE_EFFECT_RUNS` (`none | failures | all`, default `failures`) and by
+  `StateMachineHook.record_runs` for a single binding.
+- Runs are buffered and written once the transition's transaction has resolved, on both
+  the successful and the failing path — **so a handler that raises is recorded rather than
+  rolled back along with the row recording it**, which is what the obvious implementation
+  loses. One `bulk_create` per transition. `on_commit` handlers, which run after the commit
+  and outside any transaction, instead open a row when they start and close it when they
+  finish. `SIDE_EFFECT_RUN_SINK` takes the unsaved rows for a project whose callers wrap
+  `transition()` in a transaction of their own.
+- The run row is deliberately narrow: neither `params` nor `metadata` is copied onto it,
+  and the exception message is kept only behind `CAPTURE_SIDE_EFFECT_ERROR_DETAIL`, off by
+  default. Both are free-form, and an exception string routinely quotes the value that
+  broke it. `error_class` is always recorded.
+
 ## [0.6.0] - 2026-09-03
 
 ### Added

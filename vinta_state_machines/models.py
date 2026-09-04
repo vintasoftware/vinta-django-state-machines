@@ -14,11 +14,15 @@ from django.utils.translation import gettext_lazy as _
 from vinta_state_machines.conf import batch_model_path, identity_model_path, scope_model_path
 from vinta_state_machines.enums import (
     BatchLifecycle,
+    CapabilityResource,
     HookEvent,
     HookTiming,
     IdentityType,
     Lifecycle,
+    RuleEffect,
+    RunRecording,
     ScopeType,
+    SideEffectOutcome,
     StateColor,
 )
 from vinta_state_machines.querysets import (
@@ -1017,6 +1021,16 @@ class StateMachineHook(TimeStampedModel):
             "Ignored for 'before' hooks."
         ),
     )
+    record_runs = models.CharField(
+        _("record runs"),
+        max_length=10,
+        choices=RunRecording.choices,
+        blank=True,
+        help_text=_(
+            "Override RECORD_SIDE_EFFECT_RUNS for this binding alone. Blank follows "
+            "the setting, which is what almost every hook should do."
+        ),
+    )
     description = models.TextField(_("description"), blank=True)
 
     class Meta:
@@ -1349,3 +1363,219 @@ class StatusBatchReport(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.key} -> {self.outcome}"
+
+
+# ------------------------------------------------------------------ capabilities
+
+
+class ScopeCapabilityRule(TimeStampedModel):
+    """One line of a tenant's policy: may this scope wire up this key?
+
+    A scope with no rows is unrestricted, which is what makes this table safe to add to
+    a running installation -- until somebody writes a rule, nothing changes.
+
+    The three resources it governs are all *registered* things: a handler key from
+    :mod:`~vinta_state_machines.side_effects`, an :class:`ActionType` key, a guard name
+    from :mod:`~vinta_state_machines.guards`.  One table rather than three, because the
+    precedence is identical for all of them and a fourth resource should cost a value
+    in :class:`~vinta_state_machines.enums.CapabilityResource` rather than a migration.
+
+    Resolution against the global scope is deliberately *not* the fallback that
+    :func:`~vinta_state_machines.scopes.resolve_machine` does.  A global *machine* is a
+    default a tenant may replace; a global *rule* is the installation saying nobody
+    touches this, and a tenant row that could undo it would be an escalation rather
+    than a customisation.  So the two are intersected: a key has to pass both.  See
+    :func:`~vinta_state_machines.capabilities.is_permitted`.
+    """
+
+    scope = models.ForeignKey(
+        scope_model_path(),
+        verbose_name=_("scope"),
+        on_delete=models.CASCADE,
+        related_name="capability_rules",
+        help_text=_(
+            "The tenant this rule constrains. Rules on the global scope constrain "
+            "every tenant, including those with rules of their own."
+        ),
+    )
+    resource = models.CharField(
+        _("resource"),
+        max_length=20,
+        choices=CapabilityResource.choices,
+        db_index=True,
+    )
+    effect = models.CharField(_("effect"), max_length=10, choices=RuleEffect.choices)
+    pattern = models.CharField(
+        _("pattern"),
+        max_length=200,
+        help_text=_(
+            "An exact key, or a glob over one: 'billing.*' covers every key in that "
+            "namespace. Matched with fnmatch, so '?' and '[abc]' work too."
+        ),
+    )
+    reason = models.TextField(
+        _("reason"),
+        blank=True,
+        help_text=_("Why this rule exists. Shown to whoever hits it while authoring."),
+    )
+    author = models.ForeignKey(
+        identity_model_path(),
+        verbose_name=_("author"),
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="authored_capability_rules",
+        help_text=_("Who wrote this rule, as they were at the time."),
+    )
+
+    class Meta:
+        verbose_name = _("scope capability rule")
+        verbose_name_plural = _("scope capability rules")
+        ordering = ("scope", "resource", "effect", "pattern")
+        constraints: ClassVar = [
+            models.UniqueConstraint(
+                fields=("scope", "resource", "effect", "pattern"),
+                name="scopecapabilityrule_unique_pattern",
+            ),
+        ]
+        indexes: ClassVar = [
+            models.Index(fields=("scope", "resource"), name="capabilityrule_lookup_idx"),
+        ]
+        permissions: ClassVar = [
+            (
+                "bypass_capability_policy",
+                "Can wire up side effects, actions and guards a scope's policy forbids",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.effect} {self.resource}:{self.pattern}"
+
+
+# --------------------------------------------------------------- side effect runs
+
+
+class SideEffectRun(TimeStampedModel):
+    """One execution of one side-effect handler: when it started, and how it ended.
+
+    Written by the engine rather than by the handler, so a handler needs to know
+    nothing about it.  How many of these exist is governed by
+    ``RECORD_SIDE_EFFECT_RUNS`` and by :attr:`StateMachineHook.record_runs`; the
+    default records only the runs that went wrong.
+
+    Deliberately narrow on purpose: the handler, the binding, the clock, the outcome.
+    Neither ``params`` nor ``metadata`` is copied here, and the exception message is
+    only kept when a project asks for it, because both are free-form and a caller will
+    eventually put something in them that must not be duplicated into a second table.
+    :attr:`handler_key` and the target columns are enough to find the run again.
+    """
+
+    # Not a foreign key to the version's hook alone: a run outlives the rows that
+    # caused it the same way a history row outlives its tenant, so the key is
+    # denormalised and the link is allowed to go.
+    hook = models.ForeignKey(
+        StateMachineHook,
+        verbose_name=_("hook"),
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="runs",
+    )
+    handler_key = models.CharField(_("handler key"), max_length=150, db_index=True)
+
+    status_transition = models.ForeignKey(
+        StatusTransition,
+        verbose_name=_("status transition"),
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="side_effect_runs",
+        help_text=_(
+            "The history row of the move this run belongs to. Set for 'before' "
+            "handlers too, even though that row did not exist while they ran: the "
+            "link is written at the end, and it is the same move. Null only when the "
+            "move never committed, which is what a failed run looks like."
+        ),
+    )
+    target_type = models.ForeignKey(
+        ContentType,
+        verbose_name=_("target type"),
+        on_delete=models.CASCADE,
+        related_name="side_effect_runs",
+    )
+    target_id = models.CharField(_("target id"), max_length=64, db_index=True)
+    target = GenericForeignKey("target_type", "target_id")
+
+    state_machine_version = models.ForeignKey(
+        StateMachineVersion,
+        verbose_name=_("state machine version"),
+        on_delete=models.PROTECT,
+        related_name="side_effect_runs",
+    )
+    scope = models.ForeignKey(
+        scope_model_path(),
+        verbose_name=_("scope"),
+        on_delete=models.PROTECT,
+        related_name="+",
+    )
+    scope_key = models.CharField(_("scope key"), max_length=255, blank=True)
+
+    status_field = models.CharField(_("status field"), max_length=100, default="status")
+    from_status_key = models.CharField(_("from status key"), max_length=100, blank=True)
+    to_status_key = models.CharField(_("to status key"), max_length=100, blank=True)
+    action_key = models.CharField(_("action key"), max_length=150, blank=True)
+    timing = models.CharField(_("timing"), max_length=10, choices=HookTiming.choices)
+    event = models.CharField(_("event"), max_length=20, choices=HookEvent.choices)
+
+    started_at = models.DateTimeField(_("started at"), db_index=True)
+    completed_at = models.DateTimeField(_("completed at"), null=True, blank=True)
+    duration_ms = models.PositiveIntegerField(
+        _("duration (ms)"),
+        null=True,
+        blank=True,
+        help_text=_("Measured on a monotonic clock, not by subtracting the two stamps."),
+    )
+    outcome = models.CharField(
+        _("outcome"),
+        max_length=20,
+        choices=SideEffectOutcome.choices,
+        default=SideEffectOutcome.RUNNING,
+        db_index=True,
+    )
+    error_class = models.CharField(
+        _("error class"),
+        max_length=200,
+        blank=True,
+        help_text=_("Qualified name of the exception, which carries no payload."),
+    )
+    error_detail = models.TextField(
+        _("error detail"),
+        blank=True,
+        help_text=_(
+            "The exception's message, truncated. Empty unless "
+            "CAPTURE_SIDE_EFFECT_ERROR_DETAIL is on: an exception string routinely "
+            "quotes the value that broke it."
+        ),
+    )
+
+    class Meta:
+        verbose_name = _("side effect run")
+        verbose_name_plural = _("side effect runs")
+        ordering = ("-started_at", "-pk")
+        indexes: ClassVar = [
+            models.Index(
+                fields=("target_type", "target_id", "-started_at"),
+                name="sideeffectrun_target_idx",
+            ),
+            models.Index(
+                fields=("scope_key", "-started_at"),
+                name="sideeffectrun_scope_idx",
+            ),
+            models.Index(
+                fields=("handler_key", "outcome", "-started_at"),
+                name="sideeffectrun_handler_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.handler_key} -> {self.outcome}"

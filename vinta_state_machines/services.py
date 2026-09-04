@@ -14,11 +14,12 @@ from typing import Any
 from django.db import models, transaction
 from django.utils import timezone
 
-from vinta_state_machines.enums import HookEvent, Lifecycle
-from vinta_state_machines.exceptions import InvalidVersionState
+from vinta_state_machines.capabilities import has_bypass, policies_for
+from vinta_state_machines.enums import CapabilityResource, HookEvent, Lifecycle
+from vinta_state_machines.exceptions import CapabilityDenied, InvalidVersionState
 from vinta_state_machines.fields import get_status_field_config
 from vinta_state_machines.graph import CREATION, VersionGraph, build_graph, invalidate_graph
-from vinta_state_machines.guards import GuardSyntaxError, validate_guard
+from vinta_state_machines.guards import NAMED_GUARD_PREFIX, GuardSyntaxError, validate_guard
 from vinta_state_machines.identities import resolve_identity
 from vinta_state_machines.models import (
     ActionType,
@@ -93,6 +94,7 @@ def validate_version(
     _check_guards(version, report)
     if check_handlers:
         _check_handlers(version, report)
+    _check_capabilities(version, report)
     _check_report_pairs(version, graph, report)
     _check_waiting_states(graph, report)
     _check_reachability(graph, report)
@@ -157,6 +159,40 @@ def _check_handlers(version: StateMachineVersion, report: ValidationReport) -> N
                 f"Hook {hook.pk} references the side effect {hook.handler_key!r}, "
                 "which no installed app registers."
             )
+
+
+def _check_capabilities(version: StateMachineVersion, report: ValidationReport) -> None:
+    """Note anything the machine's scope is no longer allowed to use.
+
+    A **warning**, deliberately, where the editor's equivalent is an error.  Policy is
+    enforced where wiring is written; by the time a draft reaches publication the rules
+    may have tightened underneath it, and refusing to publish a graph that was
+    perfectly legal when it was drawn turns a control into an outage.  The warning is
+    what surfaces it -- and ``check_scope_capabilities`` is what finds every version in
+    the same position after a rule changes.
+    """
+    policies = policies_for(version.state_machine.scope)
+    actions = policies[CapabilityResource.ACTION]
+    guards = policies[CapabilityResource.GUARD]
+    effects = policies[CapabilityResource.SIDE_EFFECT]
+    if actions.unrestricted and guards.unrestricted and effects.unrestricted:
+        return
+
+    for transition in version.transitions.select_related("action_type"):
+        if transition.action_type_id is not None:
+            reason = actions.reason(transition.action_type.key)
+            if reason is not None:
+                report.warnings.append(f"Transition {transition.name!r}: {reason}.")
+        guard = (transition.guard or "").strip()
+        if guard.startswith(NAMED_GUARD_PREFIX):
+            reason = guards.reason(guard[1:].strip())
+            if reason is not None:
+                report.warnings.append(f"Transition {transition.name!r}: {reason}.")
+
+    for hook in version.hooks.filter(is_active=True):
+        reason = effects.reason(hook.handler_key)
+        if reason is not None:
+            report.warnings.append(f"Hook {hook.pk}: {reason}.")
 
 
 def _check_reachability(graph: VersionGraph, report: ValidationReport) -> None:
@@ -387,7 +423,13 @@ def rebase_record(
 
 
 @transaction.atomic
-def define_machine(definition: dict[str, Any], *, author: Any = None) -> StateMachineVersion:
+def define_machine(
+    definition: dict[str, Any],
+    *,
+    author: Any = None,
+    actor: Any = None,
+    enforce_policy: bool = True,
+) -> StateMachineVersion:
     """Create a machine, its vocabulary and a draft version from a plain dict.
 
     This is the shape the ``import_state_machine`` command reads, and the most convenient
@@ -410,10 +452,19 @@ def define_machine(definition: dict[str, Any], *, author: Any = None) -> StateMa
                 ],
             }
         )
+
+    The target scope's capability rules apply, so a definition cannot seed a tenant
+    with a handler that tenant is not allowed to use.  ``actor`` names whoever is doing
+    it, for the bypass permission; ``enforce_policy=False`` skips the check outright,
+    which is what an operator running ``import_state_machine --ignore-policy`` gets.
     """
+    scope = scope_from_key(definition.get("scope"))
+    if enforce_policy:
+        _assert_definition_permitted(definition, scope=scope, actor=actor or author)
+
     machine, _created = StateMachine.objects.update_or_create(
         key=definition["key"],
-        scope=scope_from_key(definition.get("scope")),
+        scope=scope,
         defaults={
             "entity_type": definition["entity_type"],
             "status_field": definition.get("status_field", "status"),
@@ -497,6 +548,31 @@ def define_machine(definition: dict[str, Any], *, author: Any = None) -> StateMa
             description=spec.get("description", ""),
         )
     return version
+
+
+def _assert_definition_permitted(definition: dict[str, Any], *, scope: Any, actor: Any) -> None:
+    """Raise on the first key in ``definition`` the scope's policy refuses.
+
+    Unlike the editor's pass, which collects everything so the canvas can show it all
+    at once, this raises on the first: a definition dict is written by a person or a
+    script and the first refusal is the one they need to fix.
+    """
+    if has_bypass(actor):
+        return
+    policies = policies_for(scope)
+
+    def refuse(resource: str, key: str) -> None:
+        reason = policies[resource].reason(key)
+        if reason is not None:
+            raise CapabilityDenied(reason.capitalize() + ".", resource=resource, key=key)
+
+    for spec in definition.get("transitions", []):
+        refuse(CapabilityResource.ACTION, spec["action"])
+        guard = str(spec.get("guard") or "").strip()
+        if guard.startswith(NAMED_GUARD_PREFIX):
+            refuse(CapabilityResource.GUARD, guard[1:].strip())
+    for spec in definition.get("hooks", []):
+        refuse(CapabilityResource.SIDE_EFFECT, spec["handler"])
 
 
 def _match_transition(

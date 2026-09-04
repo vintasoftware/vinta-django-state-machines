@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from django.core.management.base import BaseCommand, CommandError
 
+from vinta_state_machines.exceptions import CapabilityDenied
 from vinta_state_machines.services import define_machine, publish_version
 
 if TYPE_CHECKING:
@@ -29,6 +30,15 @@ class Command(BaseCommand):
             action="store_true",
             help="With --publish, do not make the new version the default.",
         )
+        parser.add_argument(
+            "--ignore-policy",
+            action="store_true",
+            help=(
+                "Import even where the target scope's capability rules forbid a key. "
+                "For the operator who wrote the rules and is deliberately seeding "
+                "around them."
+            ),
+        )
 
     def handle(self, *args: Any, **options: Any) -> None:
         path: Path = options["path"]
@@ -41,7 +51,10 @@ class Command(BaseCommand):
 
         definitions = payload if isinstance(payload, list) else [payload]
         for definition in definitions:
-            version = define_machine(definition)
+            try:
+                version = define_machine(definition, enforce_policy=not options["ignore_policy"])
+            except CapabilityDenied as exc:
+                raise CommandError(f"{exc} Pass --ignore-policy to import anyway.") from exc
             self.stdout.write(self.style.SUCCESS(f"Created draft {version}"))
             if options["publish"]:
                 report = publish_version(version, make_default=not options["no_default"])

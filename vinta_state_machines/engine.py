@@ -41,6 +41,7 @@ from vinta_state_machines.models import (
     StateMachineVersion,
     StatusTransition,
 )
+from vinta_state_machines.runs import RunRecorder
 from vinta_state_machines.scopes import resolve_machine
 from vinta_state_machines.side_effects import SideEffectContext, run_hooks
 
@@ -481,48 +482,61 @@ def transition(
             touched=touched,
         )
 
-    with transaction.atomic():
-        _fire(graph, HookTiming.BEFORE, spec, from_key, make_context, None)
+    recorder = RunRecorder(
+        instance=instance, graph=graph, version=version, spec=spec, from_key=from_key
+    )
+    record: StatusTransition | None = None
+    try:
+        with transaction.atomic():
+            _fire(graph, HookTiming.BEFORE, spec, from_key, make_context, None, recorder)
 
-        setattr(instance, field_name, spec.to_key)
-        touched_fields = [field_name]
-        if getattr(instance, f"{config.version_field}_id", None) is None:
-            setattr(instance, config.version_field, version)
-            touched_fields.append(config.version_field)
+            setattr(instance, field_name, spec.to_key)
+            touched_fields = [field_name]
+            if getattr(instance, f"{config.version_field}_id", None) is None:
+                setattr(instance, config.version_field, version)
+                touched_fields.append(config.version_field)
 
-        if save:
-            if instance.pk is None:
-                instance.save()
-            else:
-                fields = list(update_fields) if update_fields is not None else touched_fields
-                # Whatever a ``before`` handler changed rides along with the status write.
-                instance.save(update_fields=_merge(fields, touched))
-        written = set(touched)
+            if save:
+                if instance.pk is None:
+                    instance.save()
+                else:
+                    fields = list(update_fields) if update_fields is not None else touched_fields
+                    # Whatever a ``before`` handler changed rides along with the status
+                    # write.
+                    instance.save(update_fields=_merge(fields, touched))
+            written = set(touched)
 
-        record = (
-            _write_history(
-                instance,
-                graph=graph,
-                version=version,
-                spec=spec,
-                from_key=from_key,
-                actor=actor,
-                comment=comment,
-                metadata=payload,
-                approval=approval,
+            record = (
+                _write_history(
+                    instance,
+                    graph=graph,
+                    version=version,
+                    spec=spec,
+                    from_key=from_key,
+                    actor=actor,
+                    comment=comment,
+                    metadata=payload,
+                    approval=approval,
+                )
+                if should_record
+                else None
             )
-            if should_record
-            else None
-        )
 
-        _fire(graph, HookTiming.AFTER, spec, from_key, make_context, record)
+            _fire(graph, HookTiming.AFTER, spec, from_key, make_context, record, recorder)
 
-        # An ``after`` handler runs past the status write, so anything it touched needs
-        # a second, targeted save inside the same transaction.
-        late = touched - written
-        if save and late and instance.pk is not None:
-            instance.save(update_fields=sorted(late))
+            # An ``after`` handler runs past the status write, so anything it touched
+            # needs a second, targeted save inside the same transaction.
+            late = touched - written
+            if save and late and instance.pk is not None:
+                instance.save(update_fields=sorted(late))
+    except Exception:
+        # The block above rolled back and took any run rows written inside it with it,
+        # which is exactly the case worth keeping: flush what was measured out here,
+        # unattached to a history row that no longer exists, and let the error go on.
+        recorder.flush_after_failure()
+        raise
 
+    recorder.flush(status_transition=record)
     return record
 
 
@@ -597,6 +611,7 @@ def _fire(
     from_key: str | None,
     make_context: Any,
     record: StatusTransition | None,
+    recorder: RunRecorder | None = None,
 ) -> None:
     """Run the hooks for one timing: leave the old state, cross the edge, enter the new.
 
@@ -613,7 +628,12 @@ def _fire(
     )
     for event, hooks in plans:
         if hooks:
-            run_hooks(list(hooks), _context_factory(make_context, timing, event, record))
+            run_hooks(
+                list(hooks),
+                _context_factory(make_context, timing, event, record),
+                recorder=recorder,
+                record=record,
+            )
 
 
 def _context_factory(

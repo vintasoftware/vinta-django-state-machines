@@ -117,3 +117,52 @@ class BatchFailureReason(models.TextChoices):
     TIMEOUT = "timeout", _("Timed out")
     CANCELLED = "cancelled", _("Cancelled")
     JOIN_FAILED = "join_failed", _("Join failed")
+
+
+class CapabilityResource(models.TextChoices):
+    """The kinds of registered thing a scope's policy can be written about.
+
+    One enum, and one policy table, rather than a table per resource: the precedence
+    rules are identical for all three, and adding a fourth should be a row in this
+    class rather than a migration and a second copy of the algorithm.
+    """
+
+    SIDE_EFFECT = "side_effect", _("Side effect")
+    ACTION = "action", _("Action / trigger")
+    GUARD = "guard", _("Guard")
+
+
+class RuleEffect(models.TextChoices):
+    """Whether a capability rule opens a key up or closes it off."""
+
+    ALLOW = "allow", _("Allow")
+    DENY = "deny", _("Deny")
+
+
+class SideEffectOutcome(models.TextChoices):
+    """How one run of one side-effect handler ended.
+
+    ``RUNNING`` is only ever visible for a deferred ``on_commit`` handler: every other
+    handler runs inside the transition's own transaction, where a half-written row
+    would not be visible to another connection anyway, so those are written once, at
+    the end, already finished.
+    """
+
+    RUNNING = "running", _("Running")
+    SUCCEEDED = "succeeded", _("Succeeded")
+    ABORTED = "aborted", _("Aborted the transition")
+    FAILED = "failed", _("Failed")
+    SKIPPED = "skipped", _("Skipped")
+
+
+class RunRecording(models.TextChoices):
+    """How much of a version's side-effect activity is written down.
+
+    ``FAILURES`` is the default because timing a handler is free while storing a row
+    per handler per transition is not, and the row that pays for itself is the one
+    explaining why a move blew up at 3am.
+    """
+
+    NONE = "none", _("Nothing")
+    FAILURES = "failures", _("Only failures")
+    ALL = "all", _("Every run")
