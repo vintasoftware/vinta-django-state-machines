@@ -36,10 +36,27 @@ from django.utils.dateparse import parse_duration
 from django.utils.duration import duration_iso_string
 from django.utils.text import slugify
 
-from vinta_state_machines.enums import HookEvent, HookTiming, Lifecycle, StateColor
+from vinta_state_machines.capabilities import (
+    CapabilityPolicy,
+    has_bypass,
+    permitted_keys,
+    policies_for,
+    policy_for,
+)
+from vinta_state_machines.enums import (
+    CapabilityResource,
+    HookEvent,
+    HookTiming,
+    Lifecycle,
+    StateColor,
+)
 from vinta_state_machines.exceptions import StateMachineError
 from vinta_state_machines.graph import invalidate_graph
-from vinta_state_machines.guards import GuardSyntaxError, validate_guard
+from vinta_state_machines.guards import (
+    NAMED_GUARD_PREFIX,
+    GuardSyntaxError,
+    validate_guard,
+)
 from vinta_state_machines.models import (
     KEY_REGEX,
     ActionType,
@@ -66,6 +83,7 @@ __all__ = [
     "EditorPayloadError",
     "action_catalog",
     "apply_editor_machine",
+    "capability_errors",
     "check_editor_machine",
     "check_guard",
     "editor_machine_template",
@@ -295,8 +313,19 @@ def editor_machine_template(machine: StateMachine) -> dict[str, Any]:
 # ----------------------------------------------------------------------- catalogs
 
 
-def side_effect_definitions() -> list[dict[str, Any]]:
-    """The registered handlers, as the editor's ``SideEffectProvider`` payload."""
+def side_effect_definitions(*, scope: Any = None, actor: Any = None) -> list[dict[str, Any]]:
+    """The registered handlers, as the editor's ``SideEffectProvider`` payload.
+
+    Narrowed to what ``scope`` is allowed to wire up, so a tenant is offered the
+    handlers it can use rather than a catalog two thirds of which will be refused on
+    save.  ``scope=None`` and an unrestricted scope both mean the whole catalog.
+    """
+    catalog = side_effect_catalog()
+    allowed = set(
+        permitted_keys(
+            scope, CapabilityResource.SIDE_EFFECT, [info.key for info in catalog], actor=actor
+        )
+    )
     return [
         {
             "id": info.key,
@@ -304,15 +333,26 @@ def side_effect_definitions() -> list[dict[str, Any]]:
             "description": info.description,
             "defaultParams": info.default_params,
         }
-        for info in side_effect_catalog()
+        for info in catalog
+        if info.key in allowed
     ]
 
 
-def action_catalog() -> list[dict[str, Any]]:
-    """The action vocabulary, as the editor's ``ActionProvider`` payload."""
+def action_catalog(*, scope: Any = None, actor: Any = None) -> list[dict[str, Any]]:
+    """The action vocabulary, as the editor's ``ActionProvider`` payload.
+
+    Narrowed the same way :func:`side_effect_definitions` is.
+    """
+    actions = list(ActionType.objects.all())
+    allowed = set(
+        permitted_keys(
+            scope, CapabilityResource.ACTION, [action.key for action in actions], actor=actor
+        )
+    )
     return [
         {"id": action.key, "name": action.name, "description": action.description}
-        for action in ActionType.objects.all()
+        for action in actions
+        if action.key in allowed
     ]
 
 
@@ -399,7 +439,74 @@ def _iter_effect_lists(
                 yield "transition", edge, timing, effects
 
 
-def check_editor_machine(payload: Any) -> list[str]:
+# --------------------------------------------------------------------- capabilities
+
+
+def _guard_key(guard: str) -> str | None:
+    """The registry key a guard names, or ``None`` for a bare expression.
+
+    Only the ``"@name"`` form is a *registered* key, so only that form is something a
+    capability rule can be written about.  An inline expression is code the author
+    typed, governed by ``ALLOW_GUARD_EXPRESSIONS`` rather than by a scope's policy --
+    a limit worth knowing about before writing an allow list of guards and expecting
+    it to be a sandbox.
+    """
+    guard = (guard or "").strip()
+    if not guard.startswith(NAMED_GUARD_PREFIX):
+        return None
+    return guard[1:].strip() or None
+
+
+def capability_errors(payload: Any, *, scope: Any = None, actor: Any = None) -> list[str]:
+    """Every key in ``payload`` that ``scope``'s policy will not let it use.
+
+    One pass over the document rather than a check threaded through each apply helper,
+    so :func:`check_editor_machine` and :func:`apply_editor_machine` cannot drift into
+    disagreeing about what is allowed -- the same property the two already hold for
+    everything else.
+
+    An empty list is the answer for an unrestricted scope, for an actor holding the
+    bypass permission, and for an installation that never wrote a rule.
+    """
+    if not isinstance(payload, dict) or has_bypass(actor):
+        return []
+
+    policies = policies_for(scope)
+    actions = policies[CapabilityResource.ACTION]
+    guards = policies[CapabilityResource.GUARD]
+    effects = policies[CapabilityResource.SIDE_EFFECT]
+    if actions.unrestricted and guards.unrestricted and effects.unrestricted:
+        return []
+
+    errors: list[str] = []
+    edge_specs = [spec for spec in payload.get("transitions") or [] if isinstance(spec, dict)]
+    state_specs = [spec for spec in payload.get("states") or [] if isinstance(spec, dict)]
+
+    for spec in edge_specs:
+        name = str(spec.get("name") or "").strip() or "?"
+        trigger = spec.get("trigger")
+        if isinstance(trigger, dict) and trigger.get("id"):
+            reason = actions.reason(str(trigger["id"]))
+            if reason is not None:
+                errors.append(f"Transition {name!r} cannot use that trigger: {reason}.")
+        key = _guard_key(str(spec.get("guard") or ""))
+        if key is not None:
+            reason = guards.reason(key)
+            if reason is not None:
+                errors.append(f"Transition {name!r} cannot use that guard: {reason}.")
+
+    for _kind, owner, _timing, specs in _iter_effect_lists(state_specs, edge_specs):
+        label = str(owner.get("name") or owner.get("id") or "?")
+        for spec in specs:
+            if not isinstance(spec, dict) or not spec.get("definitionId"):
+                continue
+            reason = effects.reason(str(spec["definitionId"]))
+            if reason is not None:
+                errors.append(f"{label!r} cannot use that side effect: {reason}.")
+    return errors
+
+
+def check_editor_machine(payload: Any, *, scope: Any = None, actor: Any = None) -> list[str]:
     """Every reason :func:`apply_editor_machine` would refuse ``payload``, read off the
     document alone.
 
@@ -465,17 +572,26 @@ def check_editor_machine(payload: Any) -> list[str]:
                 errors.append("Every side effect must be an object.")
             elif not spec.get("definitionId"):
                 errors.append("A side effect is missing the key of its handler.")
+
+    errors.extend(capability_errors(payload, scope=scope, actor=actor))
     return errors
 
 
 @transaction.atomic
-def apply_editor_machine(version: StateMachineVersion, payload: Any) -> StateMachineVersion:
+def apply_editor_machine(
+    version: StateMachineVersion, payload: Any, *, actor: Any = None
+) -> StateMachineVersion:
     """Reconcile a draft version with a machine document from the canvas.
 
     Rows are matched by id and updated in place, so primary keys — and the hooks and
     history pointing at them — survive an edit.  Anything the document no longer
     mentions is deleted.  Published and archived versions are immutable and are
     refused outright.
+
+    ``actor`` is whoever is saving.  Their scope's capability rules decide which
+    triggers, guards and side effects the document may name, unless they hold the
+    bypass permission — which is how staff wire a handler into a tenant's machine that
+    the tenant could not have wired itself.
     """
     if not version.is_editable:
         raise EditorPayloadError(
@@ -502,11 +618,22 @@ def apply_editor_machine(version: StateMachineVersion, payload: Any) -> StateMac
     if errors:
         raise EditorPayloadError(errors)
 
+    scope = version.state_machine.scope
+    bypass = has_bypass(actor)
+    errors.extend(capability_errors(payload, scope=scope, actor=actor))
+    if errors:
+        raise EditorPayloadError(errors)
+
     states = _apply_states(version, state_specs, initial, final, errors)
     if errors:
         raise EditorPayloadError(errors)
 
-    transitions = _apply_transitions(version, edge_specs, states, errors)
+    action_policy = (
+        CapabilityPolicy(resource=CapabilityResource.ACTION)
+        if bypass
+        else policy_for(scope, CapabilityResource.ACTION)
+    )
+    transitions = _apply_transitions(version, edge_specs, states, errors, action_policy)
     if errors:
         raise EditorPayloadError(errors)
 
@@ -634,8 +761,17 @@ def _apply_transitions(
     specs: list[dict[str, Any]],
     states: dict[str, StateMachineState],
     errors: list[str],
+    action_policy: CapabilityPolicy | None = None,
 ) -> dict[str, StateMachineTransition]:
-    """Upsert every edge, ordering each among the edges that leave the same state."""
+    """Upsert every edge, ordering each among the edges that leave the same state.
+
+    A trigger the canvas names but the catalog does not have is normally created --
+    that is how a new verb gets into the vocabulary without leaving the editor.  A
+    scope under an action policy does not get that: *using* the vocabulary and
+    *extending* it are different privileges, and an allow list of ``risk.*`` should
+    not be a licence to mint ``risk.anything``.  So a restricted scope may only name
+    actions that already exist.
+    """
     existing = {edge.pk: edge for edge in version.transitions.all()}
     siblings: dict[str | None, int] = {}
     kept: set[int] = set()
@@ -660,10 +796,21 @@ def _apply_transitions(
         if not isinstance(trigger, dict) or not trigger.get("id"):
             errors.append(f"Transition {name!r} has no trigger; pick an action for it.")
             continue
-        action, _ = ActionType.objects.get_or_create(
-            key=str(trigger["id"]),
-            defaults={"name": str(trigger.get("name") or trigger["id"])},
-        )
+        action_key = str(trigger["id"])
+        if action_policy is not None and not action_policy.unrestricted:
+            action = ActionType.objects.filter(key=action_key).first()
+            if action is None:
+                errors.append(
+                    f"Transition {name!r} names the trigger {action_key!r}, which is not "
+                    "in the action catalog. This scope's policy does not allow adding "
+                    "one, so an administrator has to create it first."
+                )
+                continue
+        else:
+            action, _ = ActionType.objects.get_or_create(
+                key=action_key,
+                defaults={"name": str(trigger.get("name") or trigger["id"])},
+            )
 
         guard = str(spec.get("guard") or "")
         verdict = check_guard(guard)
@@ -894,6 +1041,7 @@ def publish_editor_machine(
     payload: Any,
     *,
     author: Any = None,
+    actor: Any = None,
     label: str | None = None,
     notes: str = "",
 ) -> tuple[StateMachineVersion, ValidationReport]:
@@ -918,6 +1066,8 @@ def publish_editor_machine(
         machine: The machine to publish a new version of.
         payload: The document the canvas posted back.
         author: The principal to record as the publisher, snapshotted at this moment.
+        actor: Whoever is saving, for the capability check.  Defaults to ``author``,
+            which is the same person in every path the admin drives.
         label: The new version's label.  Defaults to bumping the latest one.
         notes: Notes for the new version.
 
@@ -940,7 +1090,7 @@ def publish_editor_machine(
     if source is not None:
         _carry_over_offscreen_hooks(source, draft)
 
-    apply_editor_machine(draft, payload)
+    apply_editor_machine(draft, payload, actor=actor if actor is not None else author)
 
     # Validated here rather than left to ``publish_version`` so a graph the canvas drew
     # badly comes back in the same shape as every other editor complaint.

@@ -15,6 +15,7 @@ Status is modelled as *data* rather than as an enum scattered across tables:
 
 from vinta_state_machines.exceptions import (
     ApprovalRequired,
+    CapabilityDenied,
     GuardFailed,
     InvalidVersionState,
     NoStateMachineVersion,
@@ -27,6 +28,7 @@ from vinta_state_machines.exceptions import (
 
 __all__ = [
     "ApprovalRequired",
+    "CapabilityDenied",
     "GuardFailed",
     "InvalidVersionState",
     "NoStateMachineVersion",

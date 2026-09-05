@@ -16,7 +16,7 @@ from typing import Any
 from django import forms
 from django.utils.translation import gettext_lazy as _
 
-from vinta_state_machines.editor import check_editor_machine
+from vinta_state_machines.editor import capability_errors, check_editor_machine
 from vinta_state_machines.models import StateMachine, StateMachineVersion
 from vinta_state_machines.scopes import get_default_scope
 
@@ -36,7 +36,18 @@ class _GraphFormMixin(forms.ModelForm):  # type: ignore[type-arg]
     The document is checked with :func:`check_editor_machine` while the form can
     still be redisplayed.  Applying it needs a saved row, which by then is too late
     to tell anybody their transition has no trigger.
+
+    The capability check is the same idea one step later.  It cannot run in
+    ``clean_graph``, because which scope's policy applies depends on a *sibling*
+    field -- the scope on one of these forms, the machine on the other -- and per
+    field cleaning has no promised order.  So it runs in :meth:`clean`, where both
+    halves are cleaned, and lands its errors on the graph field anyway, next to the
+    canvas that drew it.
     """
+
+    #: Whoever is filling the form in, set by the admin.  Their bypass permission, if
+    #: they have one, is what lets staff draw a graph a tenant could not have drawn.
+    actor: Any = None
 
     graph = forms.JSONField(
         required=False,
@@ -52,6 +63,20 @@ class _GraphFormMixin(forms.ModelForm):  # type: ignore[type-arg]
         if errors:
             raise forms.ValidationError(errors)
         return document
+
+    def capability_scope(self) -> Any:
+        """Whose policy governs the graph this form carries."""
+        return None
+
+    def clean(self) -> dict[str, Any]:
+        cleaned: dict[str, Any] = super().clean() or {}
+        document = cleaned.get(GRAPH_FIELD)
+        if document:
+            for error in capability_errors(
+                document, scope=self.capability_scope(), actor=self.actor
+            ):
+                self.add_error(GRAPH_FIELD, error)
+        return cleaned
 
 
 class StateMachineWithVersionForm(_GraphFormMixin):
@@ -104,6 +129,9 @@ class StateMachineWithVersionForm(_GraphFormMixin):
     def clean_scope(self) -> Any:
         return self.cleaned_data.get("scope") or get_default_scope()
 
+    def capability_scope(self) -> Any:
+        return self.cleaned_data.get("scope")
+
 
 class StateMachineVersionAddForm(_GraphFormMixin):
     """Creates a new version of an existing machine, graph and all.
@@ -119,6 +147,10 @@ class StateMachineVersionAddForm(_GraphFormMixin):
     class Meta:
         model = StateMachineVersion
         fields = ("state_machine", "version", "notes")
+
+    def capability_scope(self) -> Any:
+        machine = self.cleaned_data.get("state_machine")
+        return None if machine is None else machine.scope
 
     def clean(self) -> dict[str, Any]:
         """Refuse a graph drawn for a different machine than the one picked.

@@ -98,6 +98,8 @@ class HookSpec:
     params: dict[str, object]
     order: int
     on_commit: bool
+    record_runs: str = ""
+    """This binding's override of ``RECORD_SIDE_EFFECT_RUNS``; ``""`` follows it."""
 
     def __str__(self) -> str:
         return f"{self.timing}:{self.event} -> {self.handler_key}"
@@ -346,6 +348,7 @@ def _hook_spec(hook: StateMachineHook, states_by_pk: dict[int, StateSpec]) -> Ho
         params=dict(hook.params or {}),
         order=hook.order,
         on_commit=hook.on_commit,
+        record_runs=hook.record_runs,
     )
 
 

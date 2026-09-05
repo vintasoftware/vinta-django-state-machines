@@ -83,6 +83,22 @@ class ApprovalRequired(StateMachineError):
         self.transition = transition
 
 
+class CapabilityDenied(StateMachineError):
+    """A scope's policy forbids wiring up the side effect, action or guard requested.
+
+    Authoring-time only.  The engine never raises this: see
+    :mod:`vinta_state_machines.capabilities` for why a published version's behaviour
+    is not allowed to depend on a policy row.
+    """
+
+    default_code = "capability_denied"
+
+    def __init__(self, message: str, *, resource: str = "", key: str = "") -> None:
+        super().__init__(message)
+        self.resource = resource
+        self.key = key
+
+
 class BatchDepthExceeded(StateMachineError):
     """A fan-out tried to nest deeper than ``MAX_BATCH_DEPTH`` allows.
 

@@ -32,10 +32,13 @@ from vinta_state_machines.forms import (
     GRAPH_FIELD,
     StateMachineVersionAddForm,
     StateMachineWithVersionForm,
+    _GraphFormMixin,
 )
 from vinta_state_machines.identities import resolve_identity
 from vinta_state_machines.models import (
     ActionType,
+    ScopeCapabilityRule,
+    SideEffectRun,
     StateMachine,
     StateMachineHook,
     StateMachineIdentity,
@@ -125,6 +128,18 @@ class HookInline(admin.TabularInline):
     )
 
 
+def _with_actor(form: Any, request: HttpRequest) -> Any:
+    """Bind the requesting user onto a graph-carrying form class.
+
+    A class attribute rather than a constructor argument, because the admin builds
+    forms in several places and reads ``base_fields`` off the class in some of them --
+    a ``functools.partial`` would satisfy the first and break the second.
+    """
+    if not issubclass(form, _GraphFormMixin):
+        return form
+    return type(form.__name__, (form,), {"actor": request.user})
+
+
 class EditorCanvasMixin(admin.ModelAdmin):
     """Shared plumbing for the two admins that put a canvas on their change form.
 
@@ -181,15 +196,36 @@ class EditorCanvasMixin(admin.ModelAdmin):
         prefix = f"admin:{self.opts.app_label}_{self.opts.model_name}_editor"
         return reverse(f"{prefix}_{suffix}", args=args, current_app=self.admin_site.name)
 
+    def _catalog_scope(self, request: HttpRequest) -> Any:
+        """Whose policy narrows the catalog: the scope of the machine being edited.
+
+        The canvas names the *machine* rather than the scope, and the scope is read off
+        it here.  Which is the point: a tampered parameter can only name a machine, and
+        naming a different one changes nothing that matters -- the catalog is a list of
+        keys, and it is ``apply_editor_machine`` reading the real scope off the version
+        it is saving that decides what may actually be wired up.
+        """
+        raw = request.GET.get("machine") or ""
+        if not raw.isdigit():
+            return None
+        machine = StateMachine.objects.filter(pk=int(raw)).select_related("scope").first()
+        return None if machine is None else machine.scope
+
     def editor_side_effects_view(self, request: HttpRequest) -> HttpResponse:
         if not self.has_view_permission(request):
             raise Http404
-        return JsonResponse(side_effect_definitions(), safe=False)
+        return JsonResponse(
+            side_effect_definitions(scope=self._catalog_scope(request), actor=request.user),
+            safe=False,
+        )
 
     def editor_actions_view(self, request: HttpRequest) -> HttpResponse:
         if not self.has_view_permission(request):
             raise Http404
-        return JsonResponse(action_catalog(), safe=False)
+        return JsonResponse(
+            action_catalog(scope=self._catalog_scope(request), actor=request.user),
+            safe=False,
+        )
 
     def editor_guard_view(self, request: HttpRequest) -> HttpResponse:
         if not self.has_view_permission(request):
@@ -202,13 +238,20 @@ class EditorCanvasMixin(admin.ModelAdmin):
             return JsonResponse({"ok": False, "errors": ["Malformed JSON."]})
         return JsonResponse(check_guard(str(payload.get("expression") or "")))
 
-    def canvas_context(self, **extra: Any) -> dict[str, Any]:
-        """What the canvas partial reads, with the endpoints every mode needs."""
+    def canvas_context(self, *, machine_pk: Any = None, **extra: Any) -> dict[str, Any]:
+        """What the canvas partial reads, with the endpoints every mode needs.
+
+        ``machine_pk`` rides on the two catalog URLs so they can narrow themselves to
+        that machine's scope.  It is absent on an add form, where no machine has been
+        chosen yet and the catalogs are therefore the whole registry -- harmless,
+        because the save path enforces the policy against the version it creates.
+        """
+        catalog = f"?machine={machine_pk}" if machine_pk is not None else ""
         context: dict[str, Any] = {
             # Loaded before the glue, so its `django.gettext` is there to label with.
             "i18n_url": self.editor_url("i18n"),
-            "side_effects_url": self.editor_url("side_effects"),
-            "actions_url": self.editor_url("actions"),
+            "side_effects_url": self.editor_url("side_effects") + catalog,
+            "actions_url": self.editor_url("actions") + catalog,
             "guard_url": self.editor_url("guard"),
             # Where a fan-out link goes. The canvas draws one machine and a fan-out
             # crosses into another, so the component only says where the user wants
@@ -305,7 +348,7 @@ class StateMachineVersionAdmin(EditorCanvasMixin):
         except json.JSONDecodeError as exc:
             return JsonResponse({"errors": [f"Malformed JSON: {exc}"]}, status=400)
         try:
-            apply_editor_machine(version, payload)
+            apply_editor_machine(version, payload, actor=request.user)
         except EditorPayloadError as exc:
             return JsonResponse({"errors": exc.errors}, status=400)
         # Re-serialized rather than echoed back: the server assigns the real ids, and
@@ -338,7 +381,7 @@ class StateMachineVersionAdmin(EditorCanvasMixin):
         """A version being added is drawn, not typed: it carries a graph."""
         if obj is None:
             kwargs["form"] = StateMachineVersionAddForm
-        return super().get_form(request, obj, change=change, **kwargs)
+        return _with_actor(super().get_form(request, obj, change=change, **kwargs), request)
 
     def get_fields(self, request: HttpRequest, obj: Any = None) -> list[Any]:
         # The hidden graph field is rendered by the canvas partial, beside the canvas
@@ -363,7 +406,7 @@ class StateMachineVersionAdmin(EditorCanvasMixin):
         if graph:
             # Refused documents were caught by the form, which is the last moment
             # anybody could still have fixed one.
-            apply_editor_machine(obj, graph)
+            apply_editor_machine(obj, graph, actor=request.user)
 
     def render_change_form(
         self,
@@ -378,6 +421,7 @@ class StateMachineVersionAdmin(EditorCanvasMixin):
         version = obj
         if version is not None and version.pk:
             context["dsm_editor"] = self.canvas_context(
+                machine_pk=version.state_machine_id,
                 machine_url=self.editor_url("machine", version.pk),
                 read_only=not version.is_editable
                 or not self.has_change_permission(request, version),
@@ -537,7 +581,7 @@ class StateMachineAdmin(EditorCanvasMixin):
     ) -> Any:
         if obj is None:
             kwargs["form"] = StateMachineWithVersionForm
-        return super().get_form(request, obj, change=change, **kwargs)
+        return _with_actor(super().get_form(request, obj, change=change, **kwargs), request)
 
     def get_fields(self, request: HttpRequest, obj: Any = None) -> list[Any]:
         # Rendered by the canvas partial instead, so its errors land on the graph.
@@ -560,7 +604,7 @@ class StateMachineAdmin(EditorCanvasMixin):
         )
         graph = form.cleaned_data.get(GRAPH_FIELD)
         if graph:
-            apply_editor_machine(version, graph)
+            apply_editor_machine(version, graph, actor=request.user)
 
     # -------------------------------------------------------------------- canvas
 
@@ -628,6 +672,7 @@ class StateMachineAdmin(EditorCanvasMixin):
         elif obj is not None and obj.pk:
             read_only = not self.has_change_permission(request, obj)
             context["dsm_editor"] = self.canvas_context(
+                machine_pk=obj.pk,
                 machine_url=self.editor_url("machine", obj.pk),
                 read_only=read_only,
                 read_only_message=_("You do not have permission to change this graph."),
@@ -664,6 +709,59 @@ class StatusTransitionAdmin(admin.ModelAdmin):
         "actor",
         "target_type",
     )
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        return False
+
+
+@admin.register(ScopeCapabilityRule)
+class ScopeCapabilityRuleAdmin(admin.ModelAdmin):
+    """A tenant's allow and deny lists, one line each.
+
+    Worth reading top to bottom rather than filtering: a policy is the *set* of rules,
+    and the deny that overrules an allow is only obvious when both are on screen.
+    """
+
+    list_display = ("scope", "resource", "effect", "pattern", "reason", "created_at")
+    list_filter = ("resource", "effect", "scope")
+    search_fields = ("pattern", "reason", "scope__scope_key", "scope__label")
+    list_select_related = ("scope",)
+    # ``raw_id_fields`` rather than ``autocomplete_fields``: the scope model is
+    # swappable, and autocomplete would make this admin's system checks depend on a
+    # project's own admin having registered that model with ``search_fields``.
+    raw_id_fields = ("scope",)
+
+    def save_model(self, request: HttpRequest, obj: Any, form: Any, change: bool) -> None:
+        if obj.author_id is None:
+            obj.author = resolve_identity(request.user)
+        super().save_model(request, obj, form, change)
+
+
+@admin.register(SideEffectRun)
+class SideEffectRunAdmin(admin.ModelAdmin):
+    """What the side effects actually did, newest first.
+
+    Read only, like the history it sits beside: these are observations, and an
+    observation somebody can edit is not one.
+    """
+
+    list_display = (
+        "started_at",
+        "handler_key",
+        "outcome",
+        "duration_ms",
+        "timing",
+        "event",
+        "target_type",
+        "target_id",
+    )
+    list_filter = ("outcome", "timing", "event", "handler_key", "state_machine_version")
+    search_fields = ("handler_key", "target_id", "scope_key", "error_class")
+    date_hierarchy = "started_at"
+    list_select_related = ("target_type", "state_machine_version")
 
     def has_add_permission(self, request: HttpRequest) -> bool:
         return False

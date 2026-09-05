@@ -34,7 +34,9 @@ This app answers those by making the graph a row rather than a decorator:
   in your audit log come from the same `ActionType` table, defined once rather than twice.
 - **Side effects wired as data.** Any app registers functions under a unique key; hook rows
   in the version say when they run — before or after a specific transition, any transition,
-  entering a state, or leaving a state.
+  entering a state, or leaving a state. `SideEffectRun` records what each one did.
+- **Capabilities per tenant.** `ScopeCapabilityRule` says which registered side effects,
+  triggers and guards a scope may wire up at all, with staff free to use everything.
 
 `StateMachineVersion.lifecycle` (`draft | published | archived`) is the one deliberate enum
 left in the design: a state machine cannot govern its own publication without infinite
@@ -424,6 +426,45 @@ queued jobs — so they never fire for a transaction that ends up rolling back.
 `validate_version` refuses to publish a version whose hooks name a handler no installed app
 registers, so a typo is caught at publish time rather than at 3am.
 
+### Recording what each handler did
+
+`SideEffectRun` writes down one execution: which handler, on which record, when it started,
+when it finished, how long it took, and how it ended (`succeeded`, `aborted`, `failed`).
+
+```python
+STATE_MACHINES = {"RECORD_SIDE_EFFECT_RUNS": "failures"}  # none | failures | all
+```
+
+`"failures"` is the default. Timing a handler is free, storing a row per handler per
+transition is not, and the row that pays for itself is the one explaining why a move blew
+up. One noisy-but-important binding can override the setting through
+`StateMachineHook.record_runs`.
+
+**Failures are the case worth having, and the obvious implementation loses them.** Every
+handler runs inside the transition's transaction, so a handler that raises rolls back the
+row recording that it raised. Runs are therefore buffered and written once the transaction
+has resolved — one `bulk_create` per transition, on both the successful and the failing
+path. Two things follow:
+
+- A caller who wraps `transition()` in a transaction of *their* own and rolls it back takes
+  these rows with it. `SIDE_EFFECT_RUN_SINK` is handed the unsaved rows if you need them
+  somewhere the rollback cannot reach.
+- `on_commit` handlers are the exception: they run after the commit, outside any
+  transaction, and they are the ones that reach the network and can hang — so they get a
+  row when they start and an update when they finish, which is the only case where a
+  `running` row is visible to anybody.
+
+The row is deliberately narrow. Neither `params` nor `metadata` is copied onto it, and the
+exception's message is kept only if you ask:
+
+```python
+STATE_MACHINES = {"CAPTURE_SIDE_EFFECT_ERROR_DETAIL": True}  # off by default
+```
+
+Both are free-form, and an exception string routinely quotes the value that broke it. The
+handler key, the target and the clock are enough to find a run again without making a
+second home for whatever was passing through. `error_class` is always recorded.
+
 ## Versioning
 
 This is the part that pays for itself. Records pin, so publishing is safe:
@@ -693,6 +734,71 @@ define_machine({"key": "risk.status", ...})                       # everyone els
 A machine with no scope is global, which is why a single-tenant project never has to know
 any of this exists.
 
+### Limiting what a tenant may wire up
+
+A machine is authored data, so a tenant editing its own flow can otherwise reach every
+side effect, trigger and named guard any installed app registered. `ScopeCapabilityRule`
+narrows that per scope, with an allow list, a deny list, or both:
+
+```python
+from vinta_state_machines.models import ScopeCapabilityRule
+
+# Acme may use the risk verbs, and nothing else.
+ScopeCapabilityRule.objects.create(scope=acme, resource="action", effect="allow", pattern="risk.*")
+# Nobody, Acme included, gets near the internal handlers.
+ScopeCapabilityRule.objects.create(
+    scope=global_scope, resource="side_effect", effect="deny", pattern="internal.*"
+)
+```
+
+`resource` is `side_effect`, `action` or `guard`. `pattern` is an exact key or a glob over
+one. Three rules decide the outcome:
+
+| | |
+| --- | --- |
+| **A scope with no rules is unrestricted** | which is why adding this table changes nothing until you write one |
+| **Deny beats allow** | always, whatever the specificity — a policy you can audit by reading it |
+| **The global scope's rules are the installation's** | so they *intersect* with a tenant's rather than being replaced by them |
+
+That last one is deliberately not the fallback machines use. A global machine is a default
+a tenant may replace; a global rule is the installation saying nobody touches this, and a
+tenant row that could undo it would be an escalation rather than a customisation.
+
+**Staff bypass it.** The permission is `state_machines.bypass_capability_policy`, so a
+superuser — or anyone you grant it to — can wire a handler into a tenant's machine that
+the tenant could not have wired itself. It is routed through `PERMISSION_CHECKER` when you
+have set one.
+
+#### Where it is enforced
+
+Only where the wiring is **written**, never while a record moves. The engine does not
+consult these rules at all: a published version is immutable and records pin it, so a
+policy row that changed what a pinned version does would take that guarantee away and
+leave "what ran when this record moved eighteen months ago" underivable from the version.
+
+| | |
+| --- | --- |
+| Editor catalogs | narrowed, so a tenant is offered the keys it can actually use |
+| Saving a canvas, `define_machine` | **refused**, with the reason |
+| `publish_version` | **warns** — a rule may have tightened since the draft was drawn, and blocking already-approved wiring on that is an outage, not a control |
+| A running transition | nothing |
+
+Because publishing only warns, one command finds the versions a new rule has left behind:
+
+```bash
+python manage.py check_scope_capabilities --fail
+```
+
+One more thing a restricted scope loses: the canvas normally creates an `ActionType` for a
+trigger it does not recognise, which is how a new verb enters the vocabulary without
+leaving the editor. A scope under an action policy may only name triggers that already
+exist — using the vocabulary and extending it are different privileges, and an allow list
+of `risk.*` should not be a licence to mint `risk.anything`.
+
+Only the `@name` guard form is a registered key, so a rule about guards governs those. An
+inline expression is code the author typed, and `ALLOW_GUARD_EXPRESSIONS` is the switch
+for that.
+
 ### Pointing the scope at your own model
 
 `StateMachineScope` is **swappable**. Subclass `AbstractStateMachineScope` over your own
@@ -899,6 +1005,13 @@ STATE_MACHINES = {
     # None disables tenancy entirely
     "IDENTITY_RESOLVER": None,  # dotted path to resolver(actor) -> IdentitySnapshot
     "CAPTURE_AUTHORIZATION_SNAPSHOT": True,  # record the actor's groups and permissions
+    "RECORD_SIDE_EFFECT_RUNS": "failures",  # none | failures | all
+    "CAPTURE_SIDE_EFFECT_ERROR_DETAIL": False,  # keep the exception message, not just
+    # its class
+    "MAX_SIDE_EFFECT_ERROR_DETAIL": 500,
+    "SIDE_EFFECT_RUN_SINK": None,  # dotted path to sink(runs); None writes them
+    "ENFORCE_CAPABILITY_POLICY": True,  # consult each scope's ScopeCapabilityRule rows
+    "CAPABILITY_BYPASS_PERMISSION": "state_machines.bypass_capability_policy",
 }
 ```
 
