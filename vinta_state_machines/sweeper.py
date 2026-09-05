@@ -28,6 +28,7 @@ from django.utils import timezone
 from vinta_state_machines.batches import JOIN, batch_model, dispatch, recount, try_claim
 from vinta_state_machines.conf import get_setting
 from vinta_state_machines.enums import BatchFailureReason, BatchLifecycle
+from vinta_state_machines.instruments import BatchEvent, observe
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -64,11 +65,16 @@ def sweep(*, now: datetime | None = None, limit: int = 1000) -> SweepReport:
     moment = now or timezone.now()
     report = SweepReport()
 
-    report.repaired = _repair_counters(limit)
-    report.claimed = _claim_complete(limit)
-    report.redispatched = _redispatch_stuck(moment, limit)
-    report.timed_out = _time_out(moment, limit)
-    return report
+    with observe(BatchEvent(operation="sweep")) as span:
+        report.repaired = _repair_counters(limit)
+        report.claimed = _claim_complete(limit)
+        report.redispatched = _redispatch_stuck(moment, limit)
+        report.timed_out = _time_out(moment, limit)
+        # A pass that did nothing is the normal case; a pass that repaired or timed
+        # anything out is the one worth graphing.  Reported as ``swept`` rather than
+        # ``total``, which on every other batch event means the children a batch expects.
+        span.set(swept=report.total, **vars(report))
+        return report
 
 
 def _repair_counters(limit: int) -> int:

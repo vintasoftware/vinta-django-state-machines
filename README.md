@@ -986,6 +986,159 @@ StatusTransition.objects.for_model(Risk).entering("mitigated")
 Rows are append-only: editing one raises. The target is a generic foreign key, so one table
 covers every status-bearing model in the project.
 
+## Instrumentation
+
+Hooks answer "what should happen when this record moves". Instruments answer "what is
+happening to this service" — and those are different enough to get a different door.
+
+```python
+STATE_MACHINES = {
+    "INSTRUMENTS": [
+        "vinta_state_machines.instruments.LoggingInstrument",
+        "myproject.telemetry.make_datadog_instrument",
+    ],
+}
+```
+
+That is the whole setup. Every transition, side effect, batch operation and authoring
+change is now observed, across every version of every machine, with no rows to author and
+nothing to remember when you publish the next version.
+
+The reason this is not a hook wired to `any_transition` is that **a refused transition
+never reaches a hook**. A guard that did not hold, a missing permission, an approval that
+was required — all of those raise before any handler fires, and they are exactly what you
+want to alert on. Hooks are also tenant data, subject to `ScopeCapabilityRule`; telemetry
+is deployment configuration, and a tenant should not be able to switch off your APM.
+
+### Writing one
+
+An instrument has one method, and it *brackets* what it watches:
+
+```python
+from contextlib import contextmanager
+
+from vinta_state_machines.instruments import Instrument, Span, TransitionEvent
+
+
+class SlowMoveInstrument(Instrument):
+    @contextmanager
+    def observe(self, span: Span):
+        yield  # the thing being watched runs here
+        if isinstance(span.event, TransitionEvent) and span.duration_ms > 500:
+            alert(f"{span.event.action} took {span.duration_ms}ms")
+```
+
+Read the span on the way *out*, not on the way in: the outcome, the duration and anything
+the engine learned along the way are only there once the body has run.
+
+Three things follow from the context-manager shape, and they are why it is preferred over
+a pair of callbacks or a signal:
+
+- **Durations are correct**, including for a move that raised half way through.
+- **Nesting is free.** A transition fired from inside a side effect of another transition
+  opens its span inside the outer one, so the tree needs no correlation id threaded
+  through it — and OpenTelemetry's own context propagation does the parenting.
+- **An APM integration is a handful of lines**, because `start_as_current_span` is already
+  a context manager.
+
+An entry in `INSTRUMENTS` is a dotted path, a class, a factory or an instance. Anything
+callable is called and whatever comes back is used, which is how an instrument that needs
+arguments gets them:
+
+```python
+# myproject/telemetry.py
+from vinta_state_machines.instruments import MetricsInstrument
+
+
+def make_datadog_instrument():
+    return MetricsInstrument(client=statsd)
+```
+
+### Refused, vetoed, or broken
+
+`span.outcome` is derived from what came through the block rather than asserted by the
+caller, which is the distinction that makes the whole thing worth wiring up:
+
+| Outcome | What happened |
+| --- | --- |
+| `ok` | It went through. |
+| `denied` | A `StateMachineError`: no such edge, guard, permission, approval. |
+| `aborted` | A `before` handler vetoed it with `AbortTransition`. |
+| `failed` | Something actually broke. |
+
+Today `denied` and `failed` look identical from outside the process. A rising `denied`
+rate is a graph or a permissions problem; a rising `failed` rate is an outage.
+
+### What is observed
+
+| Event | Where it opens |
+| --- | --- |
+| `TransitionEvent` | `transition()`, before the lifecycle check — so a refusal is inside the span. |
+| `SideEffectEvent` | Each handler, nested under its move. `deferred=True` for `on_commit` ones. |
+| `BatchEvent` | `open_batch`, `seal`, `report`, `abandon`, the join and cancel workers, and each `sweep()`. |
+| `AuthoringEvent` | `publish_version`, `clone_version`, `archive_version`, `set_default_version`, `rebase_record`, `define_machine`. |
+| `GraphLoadEvent` | A graph cache miss — which is what explains a latency jump right after a deploy. |
+| `InspectionEvent` | `available_transitions` and `can_transition`, **only** under `INSTRUMENT_INSPECTION`. |
+
+Inspection is off by default because those two are called once per button per record per
+page render, and a span each would swamp everything else. Turn it on when a list view has
+gone quadratic.
+
+Handlers can join their own logs up to the move that caused them without a thread-local:
+
+```python
+@register_side_effect("risk.notify_owner")
+def notify_owner(context):
+    logger.info("notifying owner", extra={"span_id": context.span_id})
+```
+
+### What ships
+
+| Instrument | Needs |
+| --- | --- |
+| `LoggingInstrument` | Nothing. One structured line per observation, on `vinta_state_machines.<channel>`, with the event in `extra["state_machine"]`. Level follows outcome. |
+| `MetricsInstrument` | A client with `incr(name, tags)` and `timing(name, ms, tags)`. |
+| `SignalInstrument` | Nothing. Re-emits as `observation_started` / `observation_finished`, with the event class as `sender`. |
+| `OpenTelemetryInstrument` | The `[otel]` extra. Covers every APM that ingests OTel, which is all of them. |
+
+`MetricsInstrument` defaults to three low-cardinality tags — `machine_key`, `action`,
+`outcome`. `target_id` and `scope_key` are available and deliberately not on by default:
+one time series per record is how a metrics bill gets interesting.
+
+```bash
+uv add 'vinta-django-state-machines[otel]'
+```
+
+### Two rules the module holds to
+
+**Telemetry cannot break a move.** Each instrument is entered and exited through a guard
+that logs and drops *its own* exceptions while letting the caller's through untouched — so
+a collector you cannot reach never turns a successful transition into a failed one, and an
+`__exit__` returning `True` never swallows a real error. Turn that off in your test suite,
+where a broken instrument should fail loudly:
+
+```python
+STATE_MACHINES = {"INSTRUMENT_STRICT": True}  # tests only
+```
+
+**An event carries keys, not contents.** Status keys, action keys, handler keys, scope
+keys, primary keys, class names. Never a `comment`, never `metadata`, never an exception
+message, never a model instance an instrument could walk. Both `comment` and `metadata`
+are free-form caller text, and unlike `SideEffectRun` — which stays in your database — an
+instrument sends what it is given out of the process. Two narrow ways out:
+
+```python
+STATE_MACHINES = {
+    "INSTRUMENT_METADATA_KEYS": ("source",),  # allowlist, not denylist
+    "INSTRUMENT_ERROR_DETAIL": False,  # the message, not just the class
+}
+```
+
+`SideEffectRun` and instruments are the same measurement kept for different readers, taken
+at the same call site and timed once. The table is durable, queryable and joinable to the
+history row; it answers "what happened to *this record*" months later. Instruments are
+ephemeral and aggregate; they answer "what is happening to *the system*" right now.
+
 ## Settings
 
 All optional, all under one key:
@@ -1005,6 +1158,12 @@ STATE_MACHINES = {
     # None disables tenancy entirely
     "IDENTITY_RESOLVER": None,  # dotted path to resolver(actor) -> IdentitySnapshot
     "CAPTURE_AUTHORIZATION_SNAPSHOT": True,  # record the actor's groups and permissions
+    "INSTRUMENTS": (),  # dotted paths, classes, factories or instances
+    "INSTRUMENT_STRICT": False,  # let an instrument's own error out; for tests
+    "INSTRUMENT_METADATA_KEYS": (),  # metadata keys a span may copy
+    "INSTRUMENT_ERROR_DETAIL": False,  # keep the exception message, not just its class
+    "MAX_INSTRUMENT_ERROR_DETAIL": 500,
+    "INSTRUMENT_INSPECTION": False,  # observe available_transitions / can_transition
     "RECORD_SIDE_EFFECT_RUNS": "failures",  # none | failures | all
     "CAPTURE_SIDE_EFFECT_ERROR_DETAIL": False,  # keep the exception message, not just
     # its class

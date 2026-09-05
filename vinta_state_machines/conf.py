@@ -151,6 +151,29 @@ DEFAULTS: dict[str, Any] = {
     # ``transition()`` in a transaction of their own points this somewhere durable:
     # a rollback out there takes the ORM-written rows with it.
     "SIDE_EFFECT_RUN_SINK": None,
+    # Instruments watching this deployment: dotted paths, classes, factories or
+    # instances.  See :mod:`vinta_state_machines.instruments`.  Empty means nothing is
+    # watching: a tuple check and one dataclass per observation, against the several
+    # queries a transition already runs.
+    "INSTRUMENTS": (),
+    # Let an instrument's own exception escape instead of being logged and dropped.
+    # Off in production -- telemetry must not be able to break the move it watches --
+    # and worth turning **on** in a test suite so a broken instrument fails loudly.
+    "INSTRUMENT_STRICT": False,
+    # Keys of a caller's ``metadata`` that may be copied onto a span.  An allowlist,
+    # because instruments send what they are given out of the process and metadata is
+    # free-form caller text.  Empty copies nothing.
+    "INSTRUMENT_METADATA_KEYS": (),
+    # Put the exception's *message* on a span, not just its class.  Off for the reason
+    # ``CAPTURE_SIDE_EFFECT_ERROR_DETAIL`` is off, and more so: a span leaves the
+    # process for a log aggregator or an APM vendor.
+    "INSTRUMENT_ERROR_DETAIL": False,
+    # Cap on that message, in characters.
+    "MAX_INSTRUMENT_ERROR_DETAIL": 500,
+    # Observe ``available_transitions`` and ``can_transition`` too.  Off because they
+    # are called once per button per record per page render and would swamp the signal;
+    # on, they are the first thing to reach for when a list view has gone quadratic.
+    "INSTRUMENT_INSPECTION": False,
     # Enforce each scope's ``ScopeCapabilityRule`` rows while authoring.  Turning this
     # off leaves the rules in place and stops consulting them, which is the switch to
     # reach for if a policy locks somebody out of their own editor.

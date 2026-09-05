@@ -40,6 +40,7 @@ from vinta_state_machines.fields import (
     status_fields_of,
 )
 from vinta_state_machines.identities import resolve_identity
+from vinta_state_machines.instruments import BatchEvent, observe
 
 if TYPE_CHECKING:
     from datetime import timedelta
@@ -95,6 +96,30 @@ def _report_model() -> Any:
     return StatusBatchReport
 
 
+def _batch_event(operation: str, batch: Any = None, **overrides: Any) -> BatchEvent:
+    """Describe one batch operation, reading only columns already in memory.
+
+    Every field here is local to the row, so building the event never adds a query to
+    the operation it is measuring -- which rules out ``join_action.key`` and the
+    machine key, both of which are a relation away.  A caller that already has them
+    loaded passes them in.
+    """
+    values: dict[str, Any] = {}
+    if batch is not None:
+        values.update(
+            batch_pk=batch.pk,
+            scope_key=batch.scope_key,
+            lifecycle=batch.lifecycle,
+            depth=batch.depth,
+            total=batch.total,
+            finished=batch.finished,
+            succeeded=batch.succeeded,
+            failure_reason=batch.failure_reason,
+        )
+    values.update(overrides)
+    return BatchEvent(operation=operation, **values)
+
+
 # ------------------------------------------------------------------- opening
 
 
@@ -136,63 +161,69 @@ def open_batch(
     from vinta_state_machines.engine import resolve_version
     from vinta_state_machines.models import ActionType, StatusDefinition
 
-    existing = live_batch_for(instance, field_name)
-    if existing is not None:
-        return existing
+    with observe(_batch_event("open", join_action=join_action)) as span:
+        existing = live_batch_for(instance, field_name)
+        if existing is not None:
+            span.set(batch_pk=existing.pk, lifecycle=existing.lifecycle, reused=True)
+            return existing
 
-    depth = 0 if parent_batch is None else parent_batch.depth + 1
-    limit = get_setting("MAX_BATCH_DEPTH")
-    if depth > limit:
-        raise BatchDepthExceeded(
-            f"Opening a batch on {instance._meta.label} would nest {depth} deep, past "
-            f"MAX_BATCH_DEPTH ({limit}). A machine whose child machine is itself will "
-            "do this; check the fan-out wiring before raising the cap."
+        depth = 0 if parent_batch is None else parent_batch.depth + 1
+        limit = get_setting("MAX_BATCH_DEPTH")
+        span.set(depth=depth)
+        if depth > limit:
+            raise BatchDepthExceeded(
+                f"Opening a batch on {instance._meta.label} would nest {depth} deep, past "
+                f"MAX_BATCH_DEPTH ({limit}). A machine whose child machine is itself will "
+                "do this; check the fan-out wiring before raising the cap."
+            )
+
+        version = resolve_version(instance, field_name)
+        graph = version.graph()
+        span.set(machine_key=graph.machine_key, scope_key=graph.scope_key)
+        status_key = getattr(instance, field_name, None) or None
+        if status_key is None:
+            raise StateMachineError(
+                f"{instance._meta.label} has no status on {field_name!r}, so there is no "
+                "state for a batch to be opened in."
+            )
+
+        opened_in = StatusDefinition.objects.get(
+            entity_type=graph.entity_type, status_field=graph.status_field, key=status_key
         )
+        action = ActionType.objects.get(key=join_action)
+        now = timezone.now()
 
-    version = resolve_version(instance, field_name)
-    graph = version.graph()
-    status_key = getattr(instance, field_name, None) or None
-    if status_key is None:
-        raise StateMachineError(
-            f"{instance._meta.label} has no status on {field_name!r}, so there is no "
-            "state for a batch to be opened in."
-        )
+        values = {
+            "target_type": ContentType.objects.get_for_model(instance, for_concrete_model=False),
+            "target_id": str(instance.pk),
+            "status_field": field_name,
+            "opened_in_status": opened_in,
+            "state_machine_version": version,
+            "join_action": action,
+            "actor": resolve_identity(actor),
+            "scope_key": graph.scope_key,
+            "depth": depth,
+            "parent_batch": parent_batch,
+            "timeout_at": None if timeout is None else now + timeout,
+            "join_retry_after": join_retry_after,
+            "metadata": dict(metadata or {}),
+            "total": total or 0,
+            "sealed": total is not None,
+        }
 
-    opened_in = StatusDefinition.objects.get(
-        entity_type=graph.entity_type, status_field=graph.status_field, key=status_key
-    )
-    action = ActionType.objects.get(key=join_action)
-    now = timezone.now()
-
-    values = {
-        "target_type": ContentType.objects.get_for_model(instance, for_concrete_model=False),
-        "target_id": str(instance.pk),
-        "status_field": field_name,
-        "opened_in_status": opened_in,
-        "state_machine_version": version,
-        "join_action": action,
-        "actor": resolve_identity(actor),
-        "scope_key": graph.scope_key,
-        "depth": depth,
-        "parent_batch": parent_batch,
-        "timeout_at": None if timeout is None else now + timeout,
-        "join_retry_after": join_retry_after,
-        "metadata": dict(metadata or {}),
-        "total": total or 0,
-        "sealed": total is not None,
-    }
-
-    model = batch_model()
-    try:
-        with transaction.atomic():
-            created: StatusBatch = model.objects.create(**values)
-            return created
-    except IntegrityError:
-        # Lost the race to another caller. The constraint did its job; use theirs.
-        raced = live_batch_for(instance, field_name)
-        if raced is None:  # pragma: no cover - the constraint says this cannot happen
-            raise
-        return raced
+        model = batch_model()
+        try:
+            with transaction.atomic():
+                created: StatusBatch = model.objects.create(**values)
+                span.set(batch_pk=created.pk, lifecycle=created.lifecycle, reused=False)
+                return created
+        except IntegrityError:
+            # Lost the race to another caller. The constraint did its job; use theirs.
+            raced = live_batch_for(instance, field_name)
+            if raced is None:  # pragma: no cover - the constraint says this cannot happen
+                raise
+            span.set(batch_pk=raced.pk, lifecycle=raced.lifecycle, reused=True, raced=True)
+            return raced
 
 
 def seal(batch: StatusBatch, total: int | None = None) -> StatusBatch:
@@ -205,13 +236,15 @@ def seal(batch: StatusBatch, total: int | None = None) -> StatusBatch:
     finished *before* the seal hangs forever: every one of them reported into a batch
     that was not yet allowed to be complete, so none of them was the last.
     """
-    resolved = batch.count_members() if total is None else total
-    batch_model().objects.filter(pk=batch.pk, lifecycle=BatchLifecycle.OPEN).update(
-        sealed=True, total=resolved
-    )
-    batch.refresh_from_db()
-    try_claim(batch.pk)
-    return batch
+    with observe(_batch_event("seal", batch)) as span:
+        resolved = batch.count_members() if total is None else total
+        batch_model().objects.filter(pk=batch.pk, lifecycle=BatchLifecycle.OPEN).update(
+            sealed=True, total=resolved
+        )
+        batch.refresh_from_db()
+        span.set(total=batch.total, finished=batch.finished, lifecycle=batch.lifecycle)
+        try_claim(batch.pk)
+        return batch
 
 
 # ------------------------------------------------------------------ counting
@@ -305,25 +338,28 @@ def report(batch: StatusBatch | int, key: str, outcome: str) -> bool:
         Whether this call was the one that counted it.
     """
     batch_id = batch if isinstance(batch, int) else batch.pk
-    if not key:
-        raise ValueError(
-            "report() needs a key naming this unit of work. Without one a retried "
-            "task counts twice, and there is no record to carry a stamp instead."
+    with observe(_batch_event("report", batch_pk=batch_id)) as span:
+        span.set(outcome_reported=outcome)
+        if not key:
+            raise ValueError(
+                "report() needs a key naming this unit of work. Without one a retried "
+                "task counts twice, and there is no record to carry a stamp instead."
+            )
+
+        _, created = _report_model().objects.get_or_create(
+            batch_id=batch_id, key=key, defaults={"outcome": outcome}
         )
+        span.set(counted=created)
+        if not created:
+            return False
 
-    _, created = _report_model().objects.get_or_create(
-        batch_id=batch_id, key=key, defaults={"outcome": outcome}
-    )
-    if not created:
-        return False
+        updates: dict[str, Any] = {"finished": F("finished") + 1}
+        if outcome == SUCCESS:
+            updates["succeeded"] = F("succeeded") + 1
+        batch_model().objects.filter(pk=batch_id, lifecycle=BatchLifecycle.OPEN).update(**updates)
 
-    updates: dict[str, Any] = {"finished": F("finished") + 1}
-    if outcome == SUCCESS:
-        updates["succeeded"] = F("succeeded") + 1
-    batch_model().objects.filter(pk=batch_id, lifecycle=BatchLifecycle.OPEN).update(**updates)
-
-    try_claim(batch_id)
-    return True
+        try_claim(batch_id)
+        return True
 
 
 def report_success(batch: StatusBatch | int, key: str) -> bool:
@@ -393,13 +429,14 @@ def run_batch_operation(operation: str, batch_id: int) -> None:
     This is the entry point a queue task calls, which is why it takes an id and a
     string rather than anything that has to be pickled or can go stale in transit.
     """
-    if operation == JOIN:
-        _run_join(batch_id)
-        return
-    if operation == CANCEL:
-        _run_cancel(batch_id)
-        return
-    raise ValueError(f"Unknown batch operation {operation!r}.")
+    with observe(_batch_event(operation, batch_pk=batch_id)):
+        if operation == JOIN:
+            _run_join(batch_id)
+            return
+        if operation == CANCEL:
+            _run_cancel(batch_id)
+            return
+        raise ValueError(f"Unknown batch operation {operation!r}.")
 
 
 # ----------------------------------------------------------------- the join
@@ -480,27 +517,32 @@ def abandon(
     Returns:
         Whether this call was the one that abandoned it.
     """
-    updates: dict[str, Any] = {
-        "lifecycle": BatchLifecycle.ABANDONED,
-        "failure_reason": reason,
-        "failure_detail": detail,
-    }
-    if child_cancel_action:
-        updates["metadata"] = {**(batch.metadata or {}), CANCEL_ACTION_KEY: child_cancel_action}
+    with observe(_batch_event("abandon", batch, failure_reason=reason)) as span:
+        updates: dict[str, Any] = {
+            "lifecycle": BatchLifecycle.ABANDONED,
+            "failure_reason": reason,
+            "failure_detail": detail,
+        }
+        if child_cancel_action:
+            updates["metadata"] = {
+                **(batch.metadata or {}),
+                CANCEL_ACTION_KEY: child_cancel_action,
+            }
 
-    abandoned = (
-        batch_model()
-        .objects.filter(pk=batch.pk)
-        .exclude(lifecycle__in=(BatchLifecycle.CLOSED, BatchLifecycle.ABANDONED))
-        .update(**updates)
-    )
-    if not abandoned:
-        return False
+        abandoned = (
+            batch_model()
+            .objects.filter(pk=batch.pk)
+            .exclude(lifecycle__in=(BatchLifecycle.CLOSED, BatchLifecycle.ABANDONED))
+            .update(**updates)
+        )
+        span.set(abandoned=bool(abandoned), cascades=bool(child_cancel_action))
+        if not abandoned:
+            return False
 
-    _report_model().objects.filter(batch_id=batch.pk).delete()
-    if child_cancel_action:
-        dispatch(CANCEL, batch.pk)
-    return True
+        _report_model().objects.filter(batch_id=batch.pk).delete()
+        if child_cancel_action:
+            dispatch(CANCEL, batch.pk)
+        return True
 
 
 def _run_cancel(batch_id: int) -> None:

@@ -24,6 +24,7 @@ every remaining handler are skipped and nothing is written.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -32,10 +33,12 @@ from django.db import models, transaction
 from django.utils.module_loading import module_has_submodule
 
 from vinta_state_machines.exceptions import StateMachineError
+from vinta_state_machines.instruments import SideEffectEvent, current_span, observe
 from vinta_state_machines.registry import Registry
 
 if TYPE_CHECKING:
     from vinta_state_machines.graph import HookSpec, TransitionSpec, VersionGraph
+    from vinta_state_machines.instruments import TransitionEvent
     from vinta_state_machines.models import StateMachineVersion, StatusTransition
 
 SideEffect = Callable[["SideEffectContext"], Any]
@@ -194,6 +197,11 @@ class SideEffectContext:
     touched: set[str] = field(default_factory=set, repr=False, compare=False)
     """Extra fields of ``instance`` the engine should persist. See :meth:`touch`."""
 
+    span_id: str = ""
+    """Id of the observation this handler is running inside, or ``""`` if nothing is
+    watching.  Log it and a handler's own lines join up with the move that caused them,
+    without a thread-local of its own.  See :mod:`vinta_state_machines.instruments`."""
+
     def touch(self, *field_names: str) -> None:
         """Ask the engine to persist these extra fields of ``instance``.
 
@@ -218,6 +226,7 @@ def run_hooks(
     *,
     recorder: Any = None,
     record: Any = None,
+    transition_event: TransitionEvent | None = None,
 ) -> None:
     """Execute ``hooks`` in order, building each handler's context lazily.
 
@@ -229,28 +238,70 @@ def run_hooks(
     written when the transition resolves; a deferred one records itself, since by the
     time it runs the buffer has long been flushed.  Left ``None``, nothing is recorded
     and the handlers run exactly as they always did.
+
+    ``transition_event`` is the move these hooks belong to.  When it is there, each
+    handler additionally gets a span of its own, nested under the transition's -- the
+    same measurement the recorder is taking, kept for a different reader.  See
+    :mod:`vinta_state_machines.instruments`.
     """
     for hook in hooks:
         handler = get_side_effect(hook.handler_key)
         context = context_factory(hook)
         if hook.on_commit and hook.timing == "after":
-            transaction.on_commit(_bind(handler, context, recorder, record))
-        elif recorder is None:
+            transaction.on_commit(_bind(handler, context, recorder, record, transition_event))
+            continue
+        with ExitStack() as stack:
+            if transition_event is not None:
+                stack.enter_context(observe(_event_for(context, transition_event, deferred=False)))
+            if recorder is not None:
+                stack.enter_context(recorder.measure(hook, context.timing, context.event))
             handler(context)
-        else:
-            with recorder.measure(hook, context.timing, context.event):
-                handler(context)
+
+
+def _event_for(
+    context: SideEffectContext, transition_event: TransitionEvent, *, deferred: bool
+) -> SideEffectEvent:
+    """Describe one handler run, hung off the move it belongs to."""
+    return SideEffectEvent(
+        handler_key=context.hook.handler_key,
+        hook_pk=context.hook.pk,
+        timing=context.timing,
+        event=context.event,
+        deferred=deferred,
+        transition=transition_event,
+    )
 
 
 def _bind(
-    handler: SideEffect, context: SideEffectContext, recorder: Any, record: Any
+    handler: SideEffect,
+    context: SideEffectContext,
+    recorder: Any,
+    record: Any,
+    transition_event: TransitionEvent | None = None,
 ) -> Callable[[], Any]:
-    def run() -> Any:
-        if recorder is None:
-            return handler(context)
-        from vinta_state_machines.runs import record_deferred_run
+    # Captured now, not when the closure runs. A deferred handler runs after the
+    # transition's ``with`` block has closed, so by then the ambient span is gone and
+    # the parent has to be carried explicitly for the trace to keep its shape.
+    parent_span = current_span()
+    parent_id = parent_span.id if parent_span is not None else None
 
-        with record_deferred_run(recorder, context.hook, context.timing, context.event, record):
+    def run() -> Any:
+        with ExitStack() as stack:
+            if transition_event is not None:
+                stack.enter_context(
+                    observe(
+                        _event_for(context, transition_event, deferred=True),
+                        parent_id=parent_id,
+                    )
+                )
+            if recorder is not None:
+                from vinta_state_machines.runs import record_deferred_run
+
+                stack.enter_context(
+                    record_deferred_run(
+                        recorder, context.hook, context.timing, context.event, record
+                    )
+                )
             return handler(context)
 
     return run
