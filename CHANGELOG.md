@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-05
+
 ### Added
 
 - **Per-tenant capabilities.** `ScopeCapabilityRule` limits which registered side effects,
@@ -451,7 +453,8 @@ package; if this is your first install, only **Added** applies.
   leaving the same state, so the two sort identically; `define_machine` still numbers
   across the version.
 
-[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.3.0...v0.4.0
