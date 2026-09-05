@@ -272,6 +272,10 @@ class StateMachineMixin:
 
     Purely sugar: everything here is also available as a module level function taking the
     instance, which is what you want for models you do not control.
+
+    Each method that reaches the database has an ``a``-prefixed twin for callers on an
+    event loop -- ``arecord.atransition("risk.assess")`` -- wrapping the engine's own
+    async twin.  See :mod:`vinta_state_machines.engine` for what those do and do not buy.
     """
 
     def state_machine_version(self, field_name: str = "status_key") -> Any:
@@ -315,6 +319,45 @@ class StateMachineMixin:
         config = get_status_field_config(type(self), field_name)  # type: ignore[arg-type]
         del config
         return StatusTransition.objects.for_object(self).with_related()  # type: ignore[arg-type]
+
+    # --------------------------------------------------------------------- async
+
+    async def astate_machine_version(self, field_name: str = "status_key") -> Any:
+        from vinta_state_machines.engine import aresolve_version
+
+        return await aresolve_version(self, field_name)  # type: ignore[arg-type]
+
+    async def astate_machine_graph(self, field_name: str = "status_key") -> Any:
+        from vinta_state_machines.engine import agraph_for
+
+        return await agraph_for(self, field_name)  # type: ignore[arg-type]
+
+    async def acurrent_state(self, field_name: str = "status_key") -> Any:
+        from vinta_state_machines.engine import acurrent_state
+
+        return await acurrent_state(self, field_name)  # type: ignore[arg-type]
+
+    async def aavailable_transitions(self, field_name: str = "status_key", **kwargs: Any) -> Any:
+        from vinta_state_machines.engine import aavailable_transitions
+
+        return await aavailable_transitions(self, field_name, **kwargs)  # type: ignore[arg-type]
+
+    async def aavailable_actions(self, field_name: str = "status_key", **kwargs: Any) -> Any:
+        from vinta_state_machines.engine import aavailable_actions
+
+        return await aavailable_actions(self, field_name, **kwargs)  # type: ignore[arg-type]
+
+    async def acan_transition(
+        self, action: str, field_name: str = "status_key", **kwargs: Any
+    ) -> bool:
+        from vinta_state_machines.engine import acan_transition
+
+        return await acan_transition(self, action, field_name, **kwargs)  # type: ignore[arg-type]
+
+    async def atransition(self, action: str, field_name: str = "status_key", **kwargs: Any) -> Any:
+        from vinta_state_machines.engine import atransition
+
+        return await atransition(self, action, field_name, **kwargs)  # type: ignore[arg-type]
 
 
 # ------------------------------------------------------------------ batch members

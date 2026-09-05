@@ -19,6 +19,29 @@ handler can be wired to several transitions and behave differently on each.
 Handlers receive a single :class:`SideEffectContext` argument.  A ``before`` handler may
 abort the whole transition by raising :class:`AbortTransition`; the status change and
 every remaining handler are skipped and nothing is written.
+
+A handler may be ``async def``, and is wired up exactly like any other::
+
+    @register_side_effect("risk.notify_owner")
+    async def notify_owner(context):
+        await httpx_client.post(WEBHOOK, json={"to": context.to_status})
+
+Async and sync handlers are interchangeable: the same key, the same
+:class:`StateMachineHook` row, the same ordering, the same veto.  What differs is only
+*where the coroutine is driven*, and that follows the caller.  Under
+:func:`~vinta_state_machines.engine.atransition` the handler is awaited on the caller's
+own event loop, so it shares the loop with the rest of the request.  Under the
+synchronous :func:`~vinta_state_machines.engine.transition` there is no loop to borrow,
+so one is created for the call and thrown away after -- correct, but a cost per handler,
+which is the reason to prefer ``atransition`` from async code.
+
+Either way the handler runs *inside the transition's transaction*, in handler order,
+and a ``before`` handler that raises :class:`AbortTransition` still vetoes the move.
+That is the point of driving the coroutine to completion rather than scheduling it: an
+awaited handler is a handler whose failure can still roll the move back.  It is also the
+caveat -- an ``async def`` handler holds an open database transaction for as long as it
+is awaiting, so a slow call belongs on an ``on_commit`` binding, where it runs past the
+commit, exactly as a slow synchronous handler would.
 """
 
 from __future__ import annotations
@@ -26,8 +49,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 
+from asgiref.sync import async_to_sync, iscoroutinefunction
 from django.apps import apps
 from django.db import models, transaction
 from django.utils.module_loading import module_has_submodule
@@ -42,9 +67,29 @@ if TYPE_CHECKING:
     from vinta_state_machines.models import StateMachineVersion, StatusTransition
 
 SideEffect = Callable[["SideEffectContext"], Any]
+"""A handler: ``def handler(context)`` or ``async def handler(context)``.
+
+Both spellings share one type because both are called the same way and both return
+whatever they return.  :func:`is_async_handler` is what tells them apart at the one
+place it matters.
+"""
 
 side_effect_registry: Registry[SideEffect] = Registry(kind="side effect")
 """The process-wide registry of side-effect handlers."""
+
+
+def is_async_handler(handler: SideEffect) -> bool:
+    """Whether ``handler`` has to be awaited.
+
+    ``iscoroutinefunction`` is asgiref's rather than ``asyncio``'s, so a handler wrapped
+    in ``functools.partial`` or marked with ``markcoroutinefunction`` answers correctly.
+    The second check covers a *callable object* with an ``async def __call__``, which is
+    how a handler that needs constructor arguments is usually written and which neither
+    implementation recognises on the instance itself.
+    """
+    return bool(iscoroutinefunction(handler)) or bool(
+        iscoroutinefunction(getattr(handler, "__call__", None))  # noqa: B004
+    )
 
 
 class AbortTransition(StateMachineError):
@@ -65,6 +110,11 @@ class SideEffectInfo:
     name: str
     description: str = ""
     default_params: dict[str, Any] = field(default_factory=dict)
+    is_async: bool = False
+    """The handler is ``async def``.  Descriptive here like everything else on this
+    class -- the engine does not consult it -- but worth surfacing in an authoring UI,
+    because it is what tells an author that this binding will hold the transaction open
+    across an ``await`` unless it is put on ``on_commit``."""
 
 
 _side_effect_info: dict[str, SideEffectInfo] = {}
@@ -93,6 +143,7 @@ def register_side_effect(
             name=name or key,
             description=description or (func.__doc__ or "").strip().split("\n\n")[0],
             default_params=dict(default_params or {}),
+            is_async=is_async_handler(func),
         )
         return registered
 
@@ -102,6 +153,11 @@ def register_side_effect(
 def get_side_effect(key: str) -> SideEffect:
     """Return the handler registered under ``key``, or raise ``NotRegistered``."""
     return side_effect_registry.get(key)
+
+
+def is_async_side_effect(key: str) -> bool:
+    """Whether the handler registered under ``key`` is ``async def``."""
+    return is_async_handler(side_effect_registry.get(key))
 
 
 def registered_side_effects() -> list[str]:
@@ -116,7 +172,10 @@ def side_effect_catalog() -> list[SideEffectInfo]:
     :func:`register_side_effect` still appears, described by its key alone.
     """
     return [
-        _side_effect_info.get(key) or SideEffectInfo(key=key, name=key)
+        _side_effect_info.get(key)
+        or SideEffectInfo(
+            key=key, name=key, is_async=is_async_handler(side_effect_registry.get(key))
+        )
         for key in side_effect_registry
     ]
 
@@ -243,6 +302,11 @@ def run_hooks(
     handler additionally gets a span of its own, nested under the transition's -- the
     same measurement the recorder is taking, kept for a different reader.  See
     :mod:`vinta_state_machines.instruments`.
+
+    An ``async def`` handler is driven to completion by :func:`call_handler` rather than
+    scheduled, so from here -- and from the recorder and the instruments bracketing it
+    -- it is indistinguishable from a synchronous one: it returns, or it raises, before
+    the next hook is reached.
     """
     for hook in hooks:
         handler = get_side_effect(hook.handler_key)
@@ -255,7 +319,80 @@ def run_hooks(
                 stack.enter_context(observe(_event_for(context, transition_event, deferred=False)))
             if recorder is not None:
                 stack.enter_context(recorder.measure(hook, context.timing, context.event))
-            handler(context)
+            call_handler(handler, context)
+
+
+def call_handler(handler: SideEffect, context: SideEffectContext) -> Any:
+    """Run one handler and return its result, awaiting it if it is a coroutine function.
+
+    Deliberately *blocking* for both kinds.  Everything wrapped around this call --
+    ``recorder.measure``, the handler's span, the enclosing ``atomic()`` block, and the
+    ``before`` timing's power to veto -- assumes the handler has finished by the time
+    the call returns.  Handing back an un-awaited coroutine would time nothing, record
+    nothing, and turn ``AbortTransition`` into an unraisable warning at garbage
+    collection instead of a rolled back move.
+
+    ``async_to_sync`` is what does the driving, and which loop it borrows depends on the
+    caller.  From :func:`~vinta_state_machines.engine.atransition` the engine's body is
+    already inside ``sync_to_async(thread_sensitive=True)``, so asgiref hands the
+    coroutine back to the caller's own running loop.  From the synchronous
+    :func:`~vinta_state_machines.engine.transition` there is no loop to hand it to, so
+    asgiref makes one for the call.
+    """
+    if is_async_handler(handler):
+        return _drive(handler, context)
+
+    result = handler(context)
+    # A *synchronous* callable can still hand back a coroutine: a plain ``def``
+    # decorator wrapped around an async handler is the usual way it happens, and
+    # ``functools.wraps`` does not carry the coroutine marker across, so
+    # :func:`is_async_handler` cannot see through it. Dropping that return value would
+    # run none of the handler and report success, so it is finished here rather than
+    # left to garbage collection and an unraisable warning.
+    if not isawaitable(result):
+        return result
+    try:
+        return _drive(_finishing(result), context)
+    except BaseException:
+        # ``_drive`` can refuse before it awaits anything, and an abandoned coroutine
+        # warns at collection. Close it so the caller sees only the real error.
+        close = getattr(result, "close", None)
+        if close is not None:
+            close()
+        raise
+
+
+def _finishing(pending: Any) -> SideEffect:
+    """Wrap an awaitable somebody else already made, so :func:`_drive` can take it.
+
+    ``async_to_sync`` insists on a coroutine *function* and will not accept a plain
+    callable that happens to return a coroutine, which is exactly what the wrapped
+    handler above is.
+    """
+
+    async def finish(context: SideEffectContext) -> Any:
+        return await pending
+
+    return finish
+
+
+def _drive(handler: SideEffect, context: SideEffectContext) -> Any:
+    """Run ``handler`` to completion on a loop, translating asgiref's one refusal."""
+    try:
+        return async_to_sync(handler)(context)
+    except RuntimeError as exc:
+        # Reached when synchronous ``transition()`` is called from a thread that is
+        # already running an event loop: asgiref cannot start a second one there. The
+        # fix is a different entry point, so say which one rather than leaving asgiref's
+        # generic message to be traced back to a hook nobody was thinking about.
+        if "AsyncToSync" not in str(exc):
+            raise
+        raise RuntimeError(
+            f"The side effect {context.hook.handler_key!r} is async, and transition() was "
+            "called from a thread that already runs an event loop, so it cannot be "
+            "awaited here. Use `await atransition(...)` from async code, or move the "
+            "call off the loop with sync_to_async."
+        ) from exc
 
 
 def _event_for(
@@ -302,6 +439,6 @@ def _bind(
                         recorder, context.hook, context.timing, context.event, record
                     )
                 )
-            return handler(context)
+            return call_handler(handler, context)
 
     return run
