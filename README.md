@@ -448,6 +448,7 @@ throws it away after:
 ```python
 from vinta_state_machines.engine import atransition
 
+
 async def assess(request, pk):
     risk = await Risk.objects.aget(pk=pk)
     await atransition(risk, "risk.assess", actor=request.user)
