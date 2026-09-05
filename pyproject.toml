@@ -40,6 +40,11 @@ classifiers = [
 ]
 dependencies = ["django>=5.2"]
 
+[project.optional-dependencies]
+# Everything ``OpenTelemetryInstrument`` needs. The API package alone is enough: a
+# project supplies its own SDK and exporter, and pinning those here would fight it.
+otel = ["opentelemetry-api>=1.20"]
+
 [project.urls]
 Homepage = "https://github.com/vintasoftware/vinta-django-state-machines"
 Documentation = "https://github.com/vintasoftware/vinta-django-state-machines#readme"
@@ -51,6 +56,9 @@ Changelog = "https://github.com/vintasoftware/vinta-django-state-machines/blob/m
 dev = [
     "django-stubs[compatible-mypy]>=5.2",
     "mypy>=1.15",
+    # The SDK, not just the API: OpenTelemetryInstrument is shipped, so it is tested
+    # against a real tracer and an in-memory exporter rather than a stand-in.
+    "opentelemetry-sdk>=1.20",
     "pre-commit>=4.1",
     "pytest>=8.3",
     "pytest-cov>=6.0",
@@ -142,6 +150,12 @@ exclude = ['/migrations/']
 # alias dance those would need buys nothing here: every method is annotated already.
 module = ["vinta_state_machines.admin"]
 disable_error_code = ["type-arg"]
+
+[[tool.mypy.overrides]]
+# OpenTelemetry is an optional extra, so it is not installed in the default dev
+# environment. The one import that reaches for it is already guarded at runtime.
+module = ["opentelemetry.*"]
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["tests.*"]

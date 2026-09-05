@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from vinta_state_machines.conf import get_setting
 from vinta_state_machines.enums import HookEvent, HookTiming
+from vinta_state_machines.instruments import GraphLoadEvent, observe
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -214,7 +215,28 @@ class VersionGraph:
 
 
 def build_graph(version: StateMachineVersion) -> VersionGraph:
-    """Read one version out of the database and freeze it."""
+    """Read one version out of the database and freeze it.
+
+    Observed, because only a cache miss reaches here: a spike in these is what explains
+    a latency jump right after a deploy, and it is invisible from anywhere else.
+    """
+    with observe(
+        GraphLoadEvent(
+            machine_key=version.state_machine.key,
+            version_pk=version.pk,
+            version_label=version.version,
+        )
+    ) as span:
+        graph = _build_graph(version)
+        span.set(
+            states=len(graph.states),
+            transitions=len(graph.transitions),
+            hooks=sum(len(bound) for bound in graph._hooks.values()),
+        )
+        return graph
+
+
+def _build_graph(version: StateMachineVersion) -> VersionGraph:
     machine = version.state_machine
     states_by_pk: dict[int, StateSpec] = {}
     states: dict[str, StateSpec] = {}

@@ -6,6 +6,47 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Global instrumentation.** `vinta_state_machines.instruments` observes every transition,
+  side effect, batch operation, authoring change and graph cache miss across every version
+  of every machine, configured once by whoever runs the service:
+  `STATE_MACHINES["INSTRUMENTS"]`. No rows to author, and nothing to remember when you
+  publish the next version.
+- **Refusals are observed.** A guard that did not hold, a missing permission and a required
+  approval all raise before any hook fires, so a `any_transition` hook can never see them.
+  A span is opened before the lifecycle check, and `span.outcome` distinguishes `denied`
+  (a `StateMachineError`) from `aborted` (a `before` handler's veto) from `failed`
+  (something actually broke) — three cases that look identical from outside the process
+  today.
+- An instrument brackets what it watches (`observe(span) -> ContextManager`), so durations
+  are correct even for a move that raised, a transition fired from inside another
+  transition's side effect nests by construction, and an OpenTelemetry integration needs no
+  correlation id threaded through anything.
+- Four built-in instruments: `LoggingInstrument` (structured lines on
+  `vinta_state_machines.<channel>`, level following outcome), `MetricsInstrument` (a
+  statsd-shaped client, three low-cardinality tags by default), `SignalInstrument`
+  (`observation_started` / `observation_finished`, with the event class as `sender`) and
+  `OpenTelemetryInstrument`, under a new `[otel]` extra.
+- **Telemetry cannot break a move.** Each instrument is entered and exited through a guard
+  that logs and drops its own exceptions while letting the caller's through untouched — an
+  `__exit__` returning `True` cannot swallow a real error. `INSTRUMENT_STRICT` turns that
+  off, which is what a test suite wants.
+- **An event carries keys, not contents.** No `comment`, no `metadata`, no exception
+  message, no model instance — because unlike `SideEffectRun`, which stays in your
+  database, an instrument sends what it is given out of the process. `INSTRUMENT_METADATA_KEYS`
+  is an allowlist and `INSTRUMENT_ERROR_DETAIL` is off, mirroring the stance
+  `CAPTURE_SIDE_EFFECT_ERROR_DETAIL` already takes.
+- `SideEffectContext.span_id`, so a handler's own log lines join up with the move that
+  caused them without a thread-local of its own.
+- `INSTRUMENT_INSPECTION` additionally observes `available_transitions` and
+  `can_transition`. Off by default: they are called once per button per record per page
+  render, and a span each would swamp the signal.
+
+Nothing changes for a project that sets no instruments: `INSTRUMENTS` defaults to empty,
+there are no migrations, and `SideEffectRun` keeps recording exactly as before — the two
+are the same measurement, taken at one call site and kept for different readers.
+
 ## [0.7.0] - 2026-09-05
 
 ### Added

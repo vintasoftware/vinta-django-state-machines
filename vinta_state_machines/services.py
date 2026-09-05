@@ -21,6 +21,7 @@ from vinta_state_machines.fields import get_status_field_config
 from vinta_state_machines.graph import CREATION, VersionGraph, build_graph, invalidate_graph
 from vinta_state_machines.guards import NAMED_GUARD_PREFIX, GuardSyntaxError, validate_guard
 from vinta_state_machines.identities import resolve_identity
+from vinta_state_machines.instruments import AuthoringEvent, actor_descriptor, observe
 from vinta_state_machines.models import (
     ActionType,
     StateMachine,
@@ -48,6 +49,28 @@ __all__ = [
 # The trailing number of a version label, which is the part that gets bumped.  Anchored
 # at the end rather than parsing the label as a whole, so "2024.1" and "v3" both work.
 _TRAILING_NUMBER = re.compile(r"^(?P<stem>.*?)(?P<number>\d+)$")
+
+
+def _authoring_event(
+    operation: str, version: StateMachineVersion | None = None, actor: Any = None, **overrides: Any
+) -> AuthoringEvent:
+    """Describe a change to the catalog itself.
+
+    These are rare and audit-relevant rather than hot, so unlike the engine's events
+    this one is free to walk a relation for the machine key.
+    """
+    values: dict[str, Any] = {}
+    if version is not None:
+        values.update(
+            machine_key=version.state_machine.key,
+            version_pk=version.pk,
+            version_label=version.version,
+            scope_key=version.state_machine.scope.scope_key,
+        )
+    actor_type, actor_key = actor_descriptor(actor)
+    values.update(actor_type=actor_type, actor_key=actor_key)
+    values.update(overrides)
+    return AuthoringEvent(operation=operation, **values)
 
 
 @dataclass
@@ -227,41 +250,45 @@ def publish_version(
     Existing records are untouched: they keep validating against the version they
     already pinned.  Returns the validation report so callers can surface warnings.
     """
-    if version.lifecycle != Lifecycle.DRAFT:
-        raise InvalidVersionState(
-            f"Only drafts can be published; {version.state_machine.key}@{version.version} "
-            f"is {version.lifecycle}."
-        )
-    report = validate_version(version) if validate else ValidationReport()
-    report.raise_if_invalid(version)
+    with observe(_authoring_event("publish", version, author)) as span:
+        if version.lifecycle != Lifecycle.DRAFT:
+            raise InvalidVersionState(
+                f"Only drafts can be published; {version.state_machine.key}@{version.version} "
+                f"is {version.lifecycle}."
+            )
+        report = validate_version(version) if validate else ValidationReport()
+        span.set(errors=len(report.errors), warnings=len(report.warnings))
+        report.raise_if_invalid(version)
 
-    version.mark_published(when=when or timezone.now())
-    if author is not None and version.author_id is None:
-        # Snapshotted here rather than linked, so "who published this, and what were
-        # they allowed to do" stays answerable after their permissions change.
-        version.author = resolve_identity(author)
-    version.save(update_fields=["lifecycle", "published_at", "author", "modified_at"])
-    invalidate_graph(version.pk)
+        version.mark_published(when=when or timezone.now())
+        if author is not None and version.author_id is None:
+            # Snapshotted here rather than linked, so "who published this, and what were
+            # they allowed to do" stays answerable after their permissions change.
+            version.author = resolve_identity(author)
+        version.save(update_fields=["lifecycle", "published_at", "author", "modified_at"])
+        invalidate_graph(version.pk)
 
-    if make_default:
-        set_default_version(version.state_machine, version)
-    return report
+        if make_default:
+            set_default_version(version.state_machine, version)
+        span.set(made_default=make_default)
+        return report
 
 
 @transaction.atomic
 def set_default_version(machine: StateMachine, version: StateMachineVersion) -> None:
     """Point a machine's ``default_version`` at ``version``."""
-    if version.state_machine_id != machine.pk:
-        raise InvalidVersionState(
-            f"{version.version} does not belong to the state machine {machine.key}."
-        )
-    if version.lifecycle != Lifecycle.PUBLISHED:
-        raise InvalidVersionState(
-            f"{machine.key}@{version.version} is {version.lifecycle}; only a published "
-            "version can be the default."
-        )
-    machine.default_version = version
-    machine.save(update_fields=["default_version", "modified_at"])
+    with observe(_authoring_event("set_default", version)):
+        if version.state_machine_id != machine.pk:
+            raise InvalidVersionState(
+                f"{version.version} does not belong to the state machine {machine.key}."
+            )
+        if version.lifecycle != Lifecycle.PUBLISHED:
+            raise InvalidVersionState(
+                f"{machine.key}@{version.version} is {version.lifecycle}; only a published "
+                "version can be the default."
+            )
+        machine.default_version = version
+        machine.save(update_fields=["default_version", "modified_at"])
 
 
 @transaction.atomic
@@ -271,17 +298,19 @@ def archive_version(version: StateMachineVersion, *, replacement: Any = None) ->
     Records that pinned it keep working — the graph is still there — but it stops being
     what new records get.  If it is the machine's default, a ``replacement`` is required.
     """
-    machine = version.state_machine
-    if machine.default_version_id == version.pk:
-        if replacement is None:
-            raise InvalidVersionState(
-                f"{machine.key}@{version.version} is the default version; pass "
-                "replacement=... to archive it."
-            )
-        set_default_version(machine, replacement)
-    version.lifecycle = Lifecycle.ARCHIVED
-    version.save(update_fields=["lifecycle", "modified_at"])
-    invalidate_graph(version.pk)
+    with observe(_authoring_event("archive", version)) as span:
+        machine = version.state_machine
+        if machine.default_version_id == version.pk:
+            span.set(was_default=True)
+            if replacement is None:
+                raise InvalidVersionState(
+                    f"{machine.key}@{version.version} is the default version; pass "
+                    "replacement=... to archive it."
+                )
+            set_default_version(machine, replacement)
+        version.lifecycle = Lifecycle.ARCHIVED
+        version.save(update_fields=["lifecycle", "modified_at"])
+        invalidate_graph(version.pk)
 
 
 def next_version_label(machine: StateMachine, *, after: str | None = None) -> str:
@@ -329,6 +358,19 @@ def clone_version(
 
     This is how you author version *n+1*: clone, edit the draft, publish.
     """
+    with observe(_authoring_event("clone", version, author)) as span:
+        clone = _clone_version(version, new_label, author=author, notes=notes)
+        span.set(clone_pk=clone.pk, clone_label=clone.version)
+        return clone
+
+
+def _clone_version(
+    version: StateMachineVersion,
+    new_label: str,
+    *,
+    author: Any = None,
+    notes: str = "",
+) -> StateMachineVersion:
     clone = StateMachineVersion.objects.create(
         state_machine=version.state_machine,
         version=new_label,
@@ -396,6 +438,29 @@ def rebase_record(
     deliberate, opt-in migration path.  The record's current status must exist as a state
     of the target version, or be renamed through ``map_status``.
     """
+    with observe(
+        _authoring_event(
+            "rebase",
+            to_version,
+            target_label=instance._meta.label_lower,
+            target_id=str(instance.pk or ""),
+        )
+    ) as span:
+        rebased = _rebase_record(
+            instance, to_version, field_name, map_status=map_status, save=save
+        )
+        span.set(to_status=getattr(rebased, field_name, "") or "")
+        return rebased
+
+
+def _rebase_record(
+    instance: models.Model,
+    to_version: StateMachineVersion,
+    field_name: str = "status_key",
+    *,
+    map_status: dict[str, str] | None = None,
+    save: bool = True,
+) -> models.Model:
     config = get_status_field_config(type(instance), field_name)
     graph = to_version.graph()
     if graph.machine_key != config.machine_key:
@@ -422,7 +487,6 @@ def rebase_record(
 # ------------------------------------------------------------- declarative authoring
 
 
-@transaction.atomic
 def define_machine(
     definition: dict[str, Any],
     *,
@@ -458,6 +522,30 @@ def define_machine(
     it, for the bypass permission; ``enforce_policy=False`` skips the check outright,
     which is what an operator running ``import_state_machine --ignore-policy`` gets.
     """
+    with observe(
+        _authoring_event("define", actor=actor, machine_key=str(definition.get("key", "")))
+    ) as span:
+        version = _define_machine(
+            definition, author=author, actor=actor, enforce_policy=enforce_policy
+        )
+        span.set(
+            version_pk=version.pk,
+            version_label=version.version,
+            scope_key=version.state_machine.scope.scope_key,
+            states=len(definition.get("states", ())),
+            transitions=len(definition.get("transitions", ())),
+        )
+        return version
+
+
+@transaction.atomic
+def _define_machine(
+    definition: dict[str, Any],
+    *,
+    author: Any = None,
+    actor: Any = None,
+    enforce_policy: bool = True,
+) -> StateMachineVersion:
     scope = scope_from_key(definition.get("scope"))
     if enforce_policy:
         _assert_definition_permitted(definition, scope=scope, actor=actor or author)

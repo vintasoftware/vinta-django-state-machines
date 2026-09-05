@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import functools
 import warnings
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from django.db import models, transaction
@@ -36,6 +37,14 @@ from vinta_state_machines.exceptions import (
 from vinta_state_machines.fields import StatusFieldConfig, get_status_field_config
 from vinta_state_machines.guards import GuardSyntaxError, evaluate
 from vinta_state_machines.identities import resolve_identity
+from vinta_state_machines.instruments import (
+    NULL_SPAN,
+    InspectionEvent,
+    TransitionEvent,
+    actor_descriptor,
+    filtered_metadata,
+    observe,
+)
 from vinta_state_machines.models import (
     StateMachine,
     StateMachineVersion,
@@ -213,20 +222,25 @@ def available_transitions(
             f"{status_key!r} is not a state of {graph.machine_key}@{graph.version_label}."
         )
 
-    results: list[AvailableTransition] = []
-    for spec in graph.transitions_from(status_key):
-        reason = _blocking_reason(
-            instance,
-            spec,
-            graph,
-            actor=actor,
-            metadata=metadata,
-            enforce_permissions=enforce_permissions,
-        )
-        allowed = reason == ""
-        if allowed or include_blocked:
-            results.append(AvailableTransition(transition=spec, allowed=allowed, reason=reason))
-    return results
+    with _inspecting(instance, graph, "available_transitions", status_key) as span:
+        candidates = graph.transitions_from(status_key)
+        results: list[AvailableTransition] = []
+        for spec in candidates:
+            reason = _blocking_reason(
+                instance,
+                spec,
+                graph,
+                actor=actor,
+                metadata=metadata,
+                enforce_permissions=enforce_permissions,
+            )
+            allowed = reason == ""
+            if allowed or include_blocked:
+                results.append(
+                    AvailableTransition(transition=spec, allowed=allowed, reason=reason)
+                )
+        span.set(considered=len(candidates), returned=len(results))
+        return results
 
 
 @_accepts_user_alias
@@ -254,23 +268,27 @@ def can_transition(
     """
     graph = graph_for(instance, field_name)
     status_key = getattr(instance, field_name, None) or None
-    try:
-        found = _candidates(graph, status_key, action, transition_name)
-    except TransitionNotAllowed:
+    with _inspecting(instance, graph, "can_transition", status_key, action) as span:
+        try:
+            found = _candidates(graph, status_key, action, transition_name)
+        except TransitionNotAllowed:
+            span.set(answer=False)
+            return False
+        for spec in found:
+            reason = _blocking_reason(
+                instance,
+                spec,
+                graph,
+                actor=actor,
+                metadata=metadata,
+                enforce_permissions=enforce_permissions,
+            )
+            # An approval requirement is a "yes, but": the edge itself is available.
+            if reason in ("", _APPROVAL_REASON):
+                span.set(answer=True)
+                return True
+        span.set(answer=False)
         return False
-    for spec in found:
-        reason = _blocking_reason(
-            instance,
-            spec,
-            graph,
-            actor=actor,
-            metadata=metadata,
-            enforce_permissions=enforce_permissions,
-        )
-        # An approval requirement is a "yes, but": the edge itself is available.
-        if reason in ("", _APPROVAL_REASON):
-            return True
-    return False
 
 
 _APPROVAL_REASON = "requires approval"
@@ -427,117 +445,196 @@ def transition(
     """
     config = get_status_field_config(type(instance), field_name)
     version = resolve_version(instance, field_name)
-    if not allow_unpublished and version.lifecycle not in get_setting("TRANSITIONABLE_LIFECYCLES"):
-        raise InvalidVersionState(
-            f"{version.state_machine.key}@{version.version} is {version.lifecycle}; "
-            "records can only move under a published version."
-        )
-
     graph = version.graph()
     from_key = getattr(instance, field_name, None) or None
-    found = _candidates(graph, from_key, action, transition_name)
 
-    source = graph.state(from_key) if from_key else None
-    if source is not None and source.is_terminal:
-        raise TransitionNotAllowed(
-            f"{source.key} is a terminal state of {graph.machine_key}@{graph.version_label}."
-        )
+    # Opened here, before the lifecycle check and before an edge has been chosen, so
+    # that a *refused* move is observed rather than missed -- which is the whole reason
+    # this is not a hook. What the engine learns later goes on through ``span.set``.
+    base_event = _transition_event(instance, graph, action, from_key, actor)
+    with observe(base_event) as span:
+        for key, value in filtered_metadata(metadata).items():
+            span.set(**{f"metadata.{key}": value})
 
-    spec = _select(instance, found, actor=actor, metadata=metadata, enforce=enforce_permissions)
-
-    if spec.requires_approval and approval is None:
-        raise ApprovalRequired(
-            f"Transition {spec} requires an approval; pass approval=... to commit it.",
-            transition=spec,
-        )
-
-    target = graph.state(spec.to_key)
-    if target is None:  # pragma: no cover - build_graph filters these out
-        raise UnknownStatus(f"{spec.to_key!r} is not a state of this version.")
-
-    should_record = get_setting("RECORD_HISTORY") if record_history is None else record_history
-    payload = dict(metadata or {})
-    touched: set[str] = set()
-
-    def make_context(
-        hook: HookSpec, timing: str, event: str, record: StatusTransition | None
-    ) -> SideEffectContext:
-        return SideEffectContext(
-            instance=instance,
-            field_name=field_name,
-            status_field=graph.status_field,
-            from_status=from_key,
-            to_status=spec.to_key,
-            action=spec.action,
-            version=version,
-            graph=graph,
-            transition=spec,
-            timing=timing,
-            event=event,
-            hook=hook,
-            actor=actor,
-            params=hook.params,
-            metadata=payload,
-            record=record,
-            touched=touched,
-        )
-
-    recorder = RunRecorder(
-        instance=instance, graph=graph, version=version, spec=spec, from_key=from_key
-    )
-    record: StatusTransition | None = None
-    try:
-        with transaction.atomic():
-            _fire(graph, HookTiming.BEFORE, spec, from_key, make_context, None, recorder)
-
-            setattr(instance, field_name, spec.to_key)
-            touched_fields = [field_name]
-            if getattr(instance, f"{config.version_field}_id", None) is None:
-                setattr(instance, config.version_field, version)
-                touched_fields.append(config.version_field)
-
-            if save:
-                if instance.pk is None:
-                    instance.save()
-                else:
-                    fields = list(update_fields) if update_fields is not None else touched_fields
-                    # Whatever a ``before`` handler changed rides along with the status
-                    # write.
-                    instance.save(update_fields=_merge(fields, touched))
-            written = set(touched)
-
-            record = (
-                _write_history(
-                    instance,
-                    graph=graph,
-                    version=version,
-                    spec=spec,
-                    from_key=from_key,
-                    actor=actor,
-                    comment=comment,
-                    metadata=payload,
-                    approval=approval,
-                )
-                if should_record
-                else None
+        if not allow_unpublished and version.lifecycle not in get_setting(
+            "TRANSITIONABLE_LIFECYCLES"
+        ):
+            raise InvalidVersionState(
+                f"{version.state_machine.key}@{version.version} is {version.lifecycle}; "
+                "records can only move under a published version."
             )
 
-            _fire(graph, HookTiming.AFTER, spec, from_key, make_context, record, recorder)
+        found = _candidates(graph, from_key, action, transition_name)
 
-            # An ``after`` handler runs past the status write, so anything it touched
-            # needs a second, targeted save inside the same transaction.
-            late = touched - written
-            if save and late and instance.pk is not None:
-                instance.save(update_fields=sorted(late))
-    except Exception:
-        # The block above rolled back and took any run rows written inside it with it,
-        # which is exactly the case worth keeping: flush what was measured out here,
-        # unattached to a history row that no longer exists, and let the error go on.
-        recorder.flush_after_failure()
-        raise
+        source = graph.state(from_key) if from_key else None
+        if source is not None and source.is_terminal:
+            raise TransitionNotAllowed(
+                f"{source.key} is a terminal state of {graph.machine_key}@{graph.version_label}."
+            )
 
-    recorder.flush(status_transition=record)
-    return record
+        spec = _select(
+            instance, found, actor=actor, metadata=metadata, enforce=enforce_permissions
+        )
+        span.set(to_status=spec.to_key, transition_name=spec.name)
+        event = replace(base_event, to_status=spec.to_key, transition_name=spec.name)
+
+        if spec.requires_approval and approval is None:
+            raise ApprovalRequired(
+                f"Transition {spec} requires an approval; pass approval=... to commit it.",
+                transition=spec,
+            )
+
+        target = graph.state(spec.to_key)
+        if target is None:  # pragma: no cover - build_graph filters these out
+            raise UnknownStatus(f"{spec.to_key!r} is not a state of this version.")
+
+        should_record = get_setting("RECORD_HISTORY") if record_history is None else record_history
+        payload = dict(metadata or {})
+        touched: set[str] = set()
+
+        def make_context(
+            hook: HookSpec, timing: str, event_name: str, record: StatusTransition | None
+        ) -> SideEffectContext:
+            return SideEffectContext(
+                instance=instance,
+                field_name=field_name,
+                status_field=graph.status_field,
+                from_status=from_key,
+                to_status=spec.to_key,
+                action=spec.action,
+                version=version,
+                graph=graph,
+                transition=spec,
+                timing=timing,
+                event=event_name,
+                hook=hook,
+                actor=actor,
+                params=hook.params,
+                metadata=payload,
+                record=record,
+                touched=touched,
+                span_id=span.id,
+            )
+
+        recorder = RunRecorder(
+            instance=instance, graph=graph, version=version, spec=spec, from_key=from_key
+        )
+        record: StatusTransition | None = None
+        try:
+            with transaction.atomic():
+                _fire(
+                    graph, HookTiming.BEFORE, spec, from_key, make_context, None, recorder, event
+                )
+
+                setattr(instance, field_name, spec.to_key)
+                touched_fields = [field_name]
+                if getattr(instance, f"{config.version_field}_id", None) is None:
+                    setattr(instance, config.version_field, version)
+                    touched_fields.append(config.version_field)
+
+                if save:
+                    if instance.pk is None:
+                        instance.save()
+                    else:
+                        fields = (
+                            list(update_fields) if update_fields is not None else touched_fields
+                        )
+                        # Whatever a ``before`` handler changed rides along with the
+                        # status write.
+                        instance.save(update_fields=_merge(fields, touched))
+                written = set(touched)
+
+                record = (
+                    _write_history(
+                        instance,
+                        graph=graph,
+                        version=version,
+                        spec=spec,
+                        from_key=from_key,
+                        actor=actor,
+                        comment=comment,
+                        metadata=payload,
+                        approval=approval,
+                    )
+                    if should_record
+                    else None
+                )
+
+                _fire(
+                    graph, HookTiming.AFTER, spec, from_key, make_context, record, recorder, event
+                )
+
+                # An ``after`` handler runs past the status write, so anything it
+                # touched needs a second, targeted save inside the same transaction.
+                late = touched - written
+                if save and late and instance.pk is not None:
+                    instance.save(update_fields=sorted(late))
+        except Exception:
+            # The block above rolled back and took any run rows written inside it with
+            # it, which is exactly the case worth keeping: flush what was measured out
+            # here, unattached to a history row that no longer exists, and let the error
+            # go on.
+            recorder.flush_after_failure()
+            raise
+
+        recorder.flush(status_transition=record)
+        if record is not None:
+            # Links the trace back to the durable row, which is the join an operator
+            # makes when an APM alert needs the record it happened to.
+            span.set(record_pk=record.pk)
+        return record
+
+
+def _transition_event(
+    instance: models.Model,
+    graph: VersionGraph,
+    action: str,
+    from_key: str | None,
+    actor: Any,
+) -> TransitionEvent:
+    """Describe a move using only keys, and without a single extra query."""
+    actor_type, actor_key = actor_descriptor(actor)
+    return TransitionEvent(
+        machine_key=graph.machine_key,
+        version_pk=graph.version_pk,
+        version_label=graph.version_label,
+        scope_key=graph.scope_key,
+        entity_type=graph.entity_type,
+        status_field=graph.status_field,
+        target_label=instance._meta.label_lower,
+        target_id=str(instance.pk or ""),
+        action=action,
+        from_status=from_key,
+        actor_type=actor_type,
+        actor_key=actor_key,
+    )
+
+
+def _inspecting(
+    instance: models.Model,
+    graph: VersionGraph,
+    operation: str,
+    status_key: str | None,
+    action: str = "",
+) -> Any:
+    """Observe a read-only question, but only when the project asked for it."""
+    if not get_setting("INSTRUMENT_INSPECTION"):
+        # Carries the shared no-op span, so the call sites below never have to ask
+        # whether anything is watching before annotating what they found.
+        return nullcontext(NULL_SPAN)
+    return observe(
+        InspectionEvent(
+            operation=operation,
+            machine_key=graph.machine_key,
+            version_pk=graph.version_pk,
+            version_label=graph.version_label,
+            scope_key=graph.scope_key,
+            target_label=instance._meta.label_lower,
+            target_id=str(instance.pk or ""),
+            status_key=status_key or "",
+            action=action,
+        )
+    )
 
 
 def _merge(fields: list[str], extra: set[str]) -> list[str]:
@@ -612,11 +709,15 @@ def _fire(
     make_context: Any,
     record: StatusTransition | None,
     recorder: RunRecorder | None = None,
+    transition_event: TransitionEvent | None = None,
 ) -> None:
     """Run the hooks for one timing: leave the old state, cross the edge, enter the new.
 
     The order is deliberate and mirrored on both sides, so a pair of ``before`` and
     ``after`` handlers on the same binding always bracket the change symmetrically.
+
+    ``transition_event`` is what a handler's own span hangs off, so it is passed down
+    rather than rebuilt: one description of the move, shared by every span under it.
     """
     plans = (
         (HookEvent.LEAVE_STATE, graph.hooks_for_state(timing, HookEvent.LEAVE_STATE, from_key)),
@@ -633,6 +734,7 @@ def _fire(
                 _context_factory(make_context, timing, event, record),
                 recorder=recorder,
                 record=record,
+                transition_event=transition_event,
             )
 
 
