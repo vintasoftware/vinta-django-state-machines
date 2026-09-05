@@ -90,6 +90,7 @@ def test_a_successful_run_carries_both_stamps_and_a_duration(risk_version, risk)
     run = SideEffectRun.objects.get()
     assert run.outcome == SideEffectOutcome.SUCCEEDED
     assert run.started_at is not None
+    assert run.completed_at is not None
     assert run.completed_at >= run.started_at
     assert run.duration_ms is not None
     assert run.error_class == ""

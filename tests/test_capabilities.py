@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from typing import Any
 
 import pytest
 from django.contrib.auth.models import Permission, User
@@ -142,7 +143,9 @@ def test_a_global_deny_binds_a_tenant_that_allows_it(acme):
     rule(acme, SIDE_EFFECT, RuleEffect.ALLOW, "internal.purge")
 
     assert not is_permitted(acme, SIDE_EFFECT, "internal.purge")
-    assert "installation denies" in denial_reason(acme, SIDE_EFFECT, "internal.purge")
+    reason = denial_reason(acme, SIDE_EFFECT, "internal.purge")
+    assert reason is not None
+    assert "installation denies" in reason
 
 
 def test_a_global_allow_list_binds_every_tenant(acme):
@@ -257,9 +260,10 @@ def test_assert_permitted_raises_with_the_reason_attached(acme):
 
 
 def test_assert_permitted_is_silent_when_the_key_is_allowed(acme):
+    """The deny above is not this key's; the assertion is that nothing is raised."""
     rule(acme, SIDE_EFFECT, RuleEffect.DENY, "testapp.boom")
 
-    assert assert_permitted(acme, SIDE_EFFECT, "testapp.record") is None
+    assert_permitted(acme, SIDE_EFFECT, "testapp.record")
 
 
 def test_permitted_keys_keeps_the_order_it_was_given(acme):
@@ -278,7 +282,7 @@ def test_permitted_keys_returns_everything_for_a_bypassing_actor(acme, db):
 # ------------------------------------------------------------------ define_machine
 
 
-def scoped_definition(risk_definition, scope_key: str) -> dict:
+def scoped_definition(risk_definition: dict[str, Any], scope_key: str) -> dict[str, Any]:
     definition = copy.deepcopy(risk_definition)
     definition["scope"] = scope_key
     return definition
