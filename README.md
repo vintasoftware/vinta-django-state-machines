@@ -426,6 +426,58 @@ queued jobs — so they never fire for a transaction that ends up rolling back.
 `validate_version` refuses to publish a version whose hooks name a handler no installed app
 registers, so a typo is caught at publish time rather than at 3am.
 
+### Async handlers
+
+A handler may be `async def`. It is registered under the same decorator, wired to the same
+`StateMachineHook` row, and runs in the same place in the same order:
+
+```python
+@register_side_effect("risk.notify_owner")
+async def notify_owner(context):
+    await http_client.post(WEBHOOK, json={"risk": context.instance.pk, "to": context.to_status})
+```
+
+Async and sync handlers mix freely on one transition, and an `async def` `before` handler
+vetoes with `AbortTransition` exactly as a synchronous one does — the coroutine is *awaited*,
+not scheduled, so its failure can still roll the move back.
+
+What differs is only which event loop drives it. Call the engine's async twin and it is
+awaited on your loop; call the synchronous engine and asgiref makes a loop for the call and
+throws it away after:
+
+```python
+from vinta_state_machines.engine import atransition
+
+
+async def assess(request, pk):
+    risk = await Risk.objects.aget(pk=pk)
+    await atransition(risk, "risk.assess", actor=request.user)
+```
+
+Every engine function has an `a`-prefixed twin — `atransition`, `acan_transition`,
+`aavailable_transitions`, `aavailable_actions`, `acurrent_state`, `agraph_for`,
+`aresolve_version`, `ainitial_status_key` — and so does the mixin, as
+`await risk.atransition("risk.assess")`.
+
+**The caveat is the transaction.** An `async def` handler awaits with the transition's
+transaction open, exactly as a synchronous handler blocks with it open. A slow call belongs
+on an `on_commit` binding either way:
+
+```python
+StateMachineHook.objects.create(..., timing="after", on_commit=True)
+```
+
+Two more things worth knowing before reaching for the twins:
+
+- **They are not parallelism.** Each twin is its synchronous counterpart moved onto a
+  thread-sensitive executor, which is what keeps `atomic()` — side effects, the status write
+  and the history row commit together or not at all — working unchanged; Django has no async
+  transaction API to build on instead. `asyncio.gather` over a hundred `atransition` calls
+  does not run a hundred transitions at once. The twins are for not blocking the loop and for
+  awaiting async hooks.
+- **Nothing is deprecated.** The synchronous functions are unchanged and remain the primary
+  API. A management command, a Celery task or a synchronous view should keep calling them.
+
 ### Recording what each handler did
 
 `SideEffectRun` writes down one execution: which handler, on which record, when it started,

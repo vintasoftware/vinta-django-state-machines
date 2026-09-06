@@ -10,6 +10,51 @@ answer ``has_perm`` -- and only snapshots it into an identity row at the moment 
 is written down.  See :mod:`vinta_state_machines.identities` for the two halves of that.
 Anything that module understands works here: a user, an identity row, an
 ``IdentitySnapshot``, or ``None`` for the system.
+
+Every public function has an ``a``-prefixed twin -- :func:`atransition`,
+:func:`acan_transition`, :func:`aavailable_transitions` and so on -- for callers that
+are already on an event loop.  See :ref:`the async section <async-engine>` below.
+
+.. _async-engine:
+
+Async
+-----
+
+The async twins exist for two reasons: an async view cannot call into the ORM directly
+without ``SynchronousOnlyOperation``, and an ``async def`` side effect needs a real loop
+to be awaited on rather than a throwaway one.
+
+Each twin is the synchronous function moved onto a thread-sensitive executor::
+
+    async def atransition(...):
+        return await sync_to_async(transition, thread_sensitive=True)(...)
+
+That is the whole implementation, and the shape is chosen rather than settled for.
+Django has no async transaction API -- there is no ``await transaction.aatomic()`` in
+5.2 or 6.0 -- so a genuinely async engine would have to give up ``atomic()``, and with
+it the single guarantee the whole module is built on: side effects, the status write and
+the history row commit together or not at all.  Running the existing block on an
+executor keeps that guarantee exactly as it is, byte for byte, with no second code path
+to drift out of step with the first.
+
+``thread_sensitive=True`` is doing real work and is not a default worth changing.  It
+pins the whole move to one thread, so the ``atomic()`` block, every query inside it and
+its ``on_commit`` callbacks all meet the same connection.  It is also what lets an
+``async def`` hook be awaited on *the caller's* loop instead of a new one: asgiref
+records the loop that entered the executor, and the ``async_to_sync`` in
+:func:`~vinta_state_machines.side_effects.call_handler` hands the coroutine back to it.
+
+What follows from that, and is worth knowing before reaching for these:
+
+* Concurrency is the executor's, not the loop's.  ``asyncio.gather`` over a hundred
+  ``atransition`` calls does not run a hundred transitions at once; it runs them as the
+  thread-sensitive executor allows.  These twins are for *not blocking the loop* and for
+  awaiting async hooks, not for parallelism.
+* An async hook awaits with the transaction open, so slow I/O still belongs on an
+  ``on_commit`` binding.
+* Nothing is deprecated.  The synchronous functions are unchanged, remain the primary
+  API, and are what a management command, a Celery task or a synchronous view should
+  keep calling.
 """
 
 from __future__ import annotations
@@ -20,6 +65,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
+from asgiref.sync import sync_to_async
 from django.db import models, transaction
 
 from vinta_state_machines.conf import get_setting
@@ -61,6 +107,14 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AvailableTransition",
+    "aavailable_actions",
+    "aavailable_transitions",
+    "acan_transition",
+    "acurrent_state",
+    "agraph_for",
+    "ainitial_status_key",
+    "aresolve_version",
+    "atransition",
     "available_actions",
     "available_transitions",
     "can_transition",
@@ -796,3 +850,146 @@ def _describe(approval: Any) -> Any:
     if isinstance(approval, (str, int, float, bool)) or approval is None:
         return approval
     return str(approval)
+
+
+# ----------------------------------------------------------------------- async
+
+# The twins, for callers already on an event loop. Each one is its synchronous
+# counterpart moved onto a thread-sensitive executor, and nothing else: the module
+# docstring explains why that is the design rather than a stopgap, and why
+# ``thread_sensitive=True`` is load-bearing in every one of them.
+#
+# Signatures are written out rather than generated with a ``**kwargs`` forwarder so that
+# the parameters, defaults and return types survive into mypy and into an editor. The
+# one thing deliberately not carried over is the pre-0.2 ``user=`` alias: it exists to
+# keep old call sites working, and there are no old async call sites.
+
+
+async def aresolve_version(
+    instance: models.Model, field_name: str = "status_key"
+) -> StateMachineVersion:
+    """Await :func:`resolve_version`."""
+    return await sync_to_async(resolve_version, thread_sensitive=True)(instance, field_name)
+
+
+async def agraph_for(instance: models.Model, field_name: str = "status_key") -> VersionGraph:
+    """Await :func:`graph_for`."""
+    return await sync_to_async(graph_for, thread_sensitive=True)(instance, field_name)
+
+
+async def acurrent_state(instance: models.Model, field_name: str = "status_key") -> Any:
+    """Await :func:`current_state`."""
+    return await sync_to_async(current_state, thread_sensitive=True)(instance, field_name)
+
+
+async def ainitial_status_key(
+    instance_or_model: models.Model | type[models.Model],
+    field_name: str = "status_key",
+    *,
+    version: StateMachineVersion | None = None,
+) -> str | None:
+    """Await :func:`initial_status_key`."""
+    return await sync_to_async(initial_status_key, thread_sensitive=True)(
+        instance_or_model, field_name, version=version
+    )
+
+
+async def aavailable_transitions(
+    instance: models.Model,
+    field_name: str = "status_key",
+    *,
+    actor: Any = None,
+    metadata: Mapping[str, Any] | None = None,
+    include_blocked: bool = False,
+    enforce_permissions: bool = True,
+) -> list[AvailableTransition]:
+    """Await :func:`available_transitions`."""
+    return await sync_to_async(available_transitions, thread_sensitive=True)(
+        instance,
+        field_name,
+        actor=actor,
+        metadata=metadata,
+        include_blocked=include_blocked,
+        enforce_permissions=enforce_permissions,
+    )
+
+
+async def aavailable_actions(
+    instance: models.Model, field_name: str = "status_key", *, actor: Any = None
+) -> list[str]:
+    """Await :func:`available_actions`."""
+    return await sync_to_async(available_actions, thread_sensitive=True)(
+        instance, field_name, actor=actor
+    )
+
+
+async def acan_transition(
+    instance: models.Model,
+    action: str,
+    field_name: str = "status_key",
+    *,
+    actor: Any = None,
+    metadata: Mapping[str, Any] | None = None,
+    transition_name: str | None = None,
+    enforce_permissions: bool = True,
+) -> bool:
+    """Await :func:`can_transition`."""
+    return await sync_to_async(can_transition, thread_sensitive=True)(
+        instance,
+        action,
+        field_name,
+        actor=actor,
+        metadata=metadata,
+        transition_name=transition_name,
+        enforce_permissions=enforce_permissions,
+    )
+
+
+async def atransition(
+    instance: models.Model,
+    action: str,
+    field_name: str = "status_key",
+    *,
+    actor: Any = None,
+    comment: str = "",
+    metadata: Mapping[str, Any] | None = None,
+    approval: Any = None,
+    transition_name: str | None = None,
+    save: bool = True,
+    update_fields: Iterable[str] | None = None,
+    record_history: bool | None = None,
+    enforce_permissions: bool = True,
+    allow_unpublished: bool = False,
+) -> StatusTransition | None:
+    """Await :func:`transition`: move ``instance`` along the edge ``action`` names.
+
+    Identical in every observable way to the synchronous call -- same edge resolution,
+    same guards, same one ``atomic()`` block, same exceptions, same return value -- with
+    two differences that matter to an async caller:
+
+    * It does not raise ``SynchronousOnlyOperation``, because the ORM work happens off
+      the loop.
+    * An ``async def`` side effect bound to this move is awaited on *this* loop, rather
+      than on a throwaway one created for the call.  That is the reason to prefer this
+      entry point over ``sync_to_async(transition)`` written out by hand at the call
+      site: the hand-written version works, but every async hook underneath it pays for
+      a fresh event loop.
+
+    ``instance`` is mutated in place exactly as it is synchronously, so its status field
+    and version pin are up to date when the await returns.
+    """
+    return await sync_to_async(transition, thread_sensitive=True)(
+        instance,
+        action,
+        field_name,
+        actor=actor,
+        comment=comment,
+        metadata=metadata,
+        approval=approval,
+        transition_name=transition_name,
+        save=save,
+        update_fields=update_fields,
+        record_history=record_history,
+        enforce_permissions=enforce_permissions,
+        allow_unpublished=allow_unpublished,
+    )

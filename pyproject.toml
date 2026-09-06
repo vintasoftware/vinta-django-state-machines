@@ -38,7 +38,10 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
-dependencies = ["django>=5.2"]
+# asgiref is Django's own dependency, but it is imported directly here -- the async
+# engine twins and async side effects are built on ``sync_to_async``/``async_to_sync``
+# -- so it is declared rather than relied on transitively.
+dependencies = ["django>=5.2", "asgiref>=3.8"]
 
 [project.optional-dependencies]
 # Everything ``OpenTelemetryInstrument`` needs. The API package alone is enough: a
@@ -61,6 +64,9 @@ dev = [
     "opentelemetry-sdk>=1.20",
     "pre-commit>=4.1",
     "pytest>=8.3",
+    # The async engine twins are exercised both through ``async_to_sync`` (which keeps
+    # the work on the test's own thread and connection) and as real coroutines.
+    "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
     "pytest-django>=4.10",
     "ruff>=0.9",
@@ -179,6 +185,8 @@ testpaths = ["tests"]
 # tests/swapped runs under its own settings module: the scope model is swapped there,
 # and Meta.swappable cannot be moved once the models are imported.
 addopts = "--strict-markers --strict-config -ra --ignore=tests/swapped"
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["error"]
 
 # ---------------------------------------------------------------- coverage

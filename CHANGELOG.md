@@ -8,6 +8,30 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Async side effects.** A handler registered with `@register_side_effect` may be
+  `async def`, and is wired to a `StateMachineHook` row exactly like a synchronous one —
+  same key, same ordering, same timings, same `on_commit`. The two kinds mix freely on one
+  transition. The coroutine is *awaited* rather than scheduled, so an `async def` `before`
+  handler still vetoes a move with `AbortTransition`, a failure still rolls the transaction
+  back, and `SideEffectRun` still times it. A callable object with an `async def __call__`
+  is recognised too, which is how a handler that needs constructor arguments is written.
+- **Async engine twins.** `atransition`, `acan_transition`, `aavailable_transitions`,
+  `aavailable_actions`, `acurrent_state`, `agraph_for`, `aresolve_version` and
+  `ainitial_status_key`, plus the matching methods on `StateMachineMixin` — so an async view
+  can move a record without `SynchronousOnlyOperation`. Each twin is its synchronous
+  counterpart on a thread-sensitive executor, which keeps the single `atomic()` block that
+  every guarantee in this library rests on: Django has no async transaction API to build on
+  instead. They are for not blocking the loop and for awaiting async hooks, not for
+  parallelism, and nothing synchronous is deprecated.
+- `atransition` awaits async hooks on the **caller's** event loop, where the synchronous
+  `transition()` has none to borrow and pays for a throwaway one per handler. That is the
+  reason to prefer it over `sync_to_async(transition)` written out at the call site.
+- `is_async_side_effect(key)`, `SideEffectInfo.is_async` and an `isAsync` field on the
+  editor's side-effect payload, so an authoring UI can show that a binding will hold the
+  transaction open across an `await` — the one caveat of an async handler, and the reason to
+  put a slow one on `on_commit`.
+- `asgiref>=3.8` is now a declared dependency. It was already installed as Django's own; it
+  is imported directly now.
 - **Global instrumentation.** `vinta_state_machines.instruments` observes every transition,
   side effect, batch operation, authoring change and graph cache miss across every version
   of every machine, configured once by whoever runs the service:

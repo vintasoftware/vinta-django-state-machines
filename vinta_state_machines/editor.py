@@ -332,6 +332,9 @@ def side_effect_definitions(*, scope: Any = None, actor: Any = None) -> list[dic
             "name": info.name,
             "description": info.description,
             "defaultParams": info.default_params,
+            # So an author can see that a binding will hold the transaction open across
+            # an ``await``, and reach for ``on_commit`` when it should not.
+            "isAsync": info.is_async,
         }
         for info in catalog
         if info.key in allowed
