@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-06
+
 ### Added
 
 - **Async side effects.** A handler registered with `@register_side_effect` may be
@@ -30,6 +32,13 @@ All notable changes to this project are documented here. The format follows
   editor's side-effect payload, so an authoring UI can show that a binding will hold the
   transaction open across an `await` — the one caveat of an async handler, and the reason to
   put a slow one on `on_commit`.
+- A handler that only *returns* a coroutine is finished too, rather than dropped — a plain
+  `def` decorator wrapped around an async handler inspects as synchronous, because
+  `functools.wraps` does not carry the coroutine marker across. Left unawaited it would run
+  none of the handler and still report success.
+- Calling the synchronous `transition()` from a thread that already runs an event loop now
+  raises a message naming the async hook that tripped it and the entry point to use
+  instead, in place of asgiref's generic `AsyncToSync` refusal.
 - `asgiref>=3.8` is now a declared dependency. It was already installed as Django's own; it
   is imported directly now.
 - **Global instrumentation.** `vinta_state_machines.instruments` observes every transition,
@@ -518,7 +527,8 @@ package; if this is your first install, only **Added** applies.
   leaving the same state, so the two sort identically; `define_machine` still numbers
   across the version.
 
-[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.4.0...v0.5.0
