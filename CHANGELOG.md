@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-10
+
+### Changed
+
+- The bundled `vinta-state-machine-editor` moves from 0.10.0 to **0.11.0**, which redraws a
+  decision. Every outcome of a decision used to be its own curve from the state, bent through
+  the one card they share, so several lines arrived at slightly different angles and left on
+  top of each other with nothing saying which line belonged to which row. The action now
+  arrives **once**, as a trunk into the card's header, and each outcome leaves from a port
+  beside its own row, on whichever side of the card faces the state it lands on. Pointing at a
+  row lights its branch. Reading down the card reads along the branches.
+- A transition card no longer passes for a state card at a glance: it wears a tinted header
+  band, a border leaning the same way, tighter corners, and a `⇢` glyph where a state's header
+  opens with its colour bar. Class names, parts and the document schema are unchanged, as is
+  every per-edge `path.edge[data-transition-id]` a host may have addressed — the trunk is a new
+  `path.edge.edge--trunk` beside them.
+- Touch and pen get their larger hit targets back. The one-line rules inside the component's
+  three `@media (pointer: coarse)` blocks had lost their braces, so a browser dropped the
+  blocks whole and a fingertip was left aiming at controls sized for a mouse. Nothing on this
+  side had to move for the fix; it arrives with the bundle.
+
 ## [0.8.0] - 2026-09-06
 
 ### Added
@@ -527,7 +548,8 @@ package; if this is your first install, only **Added** applies.
   leaving the same state, so the two sort identically; `define_machine` still numbers
   across the version.
 
-[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/vintasoftware/vinta-django-state-machines/compare/v0.5.0...v0.6.0

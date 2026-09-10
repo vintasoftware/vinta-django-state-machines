@@ -1263,7 +1263,7 @@ matrix pairs factors explicitly rather than taking the full product.
 package needs no Node toolchain. To move to a new release:
 
 ```bash
-npm pack vinta-state-machine-editor@<version>   # currently 0.9.0
+npm pack vinta-state-machine-editor@<version>   # currently 0.11.0
 tar -xzf vinta-state-machine-editor-<version>.tgz
 cp package/dist/bundled.js \
   vinta_state_machines/static/vinta_state_machines/state-machine-editor.js
